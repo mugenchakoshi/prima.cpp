@@ -918,7 +918,7 @@ static bool assign_layers_to_device(
             master.model_flops.layer_iq1m_f32  / (dev.cpu_props.flops_iq1m_f32  * 1e9 + EPS) ) * 1000; // in ms
 
         float t_kv_cpy_cpu = dev.memory.mem_cpy_delay; // in ms
-        // t_read_ram_cpu = b_prime / (dev.memory.cpu_read_ram_bw * 1e9) * 1000; // in ms
+        t_read_ram_cpu = b_prime / (dev.memory.cpu_read_ram_bw * 1e9) * 1000; // in ms
 
         alpha[m] = t_calc_cpu + t_kv_cpy_cpu + t_read_ram_cpu; // in ms
 
@@ -944,7 +944,7 @@ static bool assign_layers_to_device(
                     master.model_flops.layer_iq1m_f32   / (dev.gpu_props.metal_flops_iq1m_f32   * 1e9 + EPS) ) * 1000; // in ms
 
                 t_kv_cpy_gpu = dev.gpu_props.metal_mem_cpy_delay; // in ms
-                // t_read_ram_gpu = b_prime / (dev.gpu_props.metal_read_vram_bw * 1e9) * 1000; // in ms
+                t_read_ram_gpu = b_prime / (dev.gpu_props.metal_read_vram_bw * 1e9) * 1000; // in ms
             } else {
                 t_calc_gpu = (
                     master.model_flops.layer_f32_f32    / (dev.gpu_props.cuda_flops_f32_f32    * 1e9 + EPS) +
@@ -961,7 +961,7 @@ static bool assign_layers_to_device(
                     master.model_flops.layer_iq1m_f32   / (dev.gpu_props.cuda_flops_iq1m_f32   * 1e9 + EPS) ) * 1000; // in ms
 
                 t_kv_cpy_gpu = dev.gpu_props.cuda_mem_cpy_delay; // in ms
-                // t_read_ram_gpu = b_prime / (dev.gpu_props.cuda_read_vram_bw * 1e9) * 1000; // in ms
+                t_read_ram_gpu = b_prime / (dev.gpu_props.cuda_read_vram_bw * 1e9) * 1000; // in ms
             }
             beta[m] = t_calc_gpu - t_calc_cpu + t_kv_cpy_gpu - t_kv_cpy_cpu + t_read_ram_gpu - t_read_ram_cpu; // in ms
         }

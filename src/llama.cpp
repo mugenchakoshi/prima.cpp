@@ -17795,6 +17795,73 @@ static void llama_output_reorder(struct llama_context * ctx) {
     }
 }
 
+// PRIMA_PROFILE=<csv path> enables per-node profiling: the scheduler's eval callback makes it run
+// every graph node on its own and synchronize, and each node's op, shapes and wall-clock time are
+// appended as a CSV row. zmq send/recv, device->host copies and whole subgraphs get rows too, so the
+// per-token time can be split into compute and communication/wait. Overrides cparams.cb_eval.
+static const char * PRIMA_PROFILE = std::getenv("PRIMA_PROFILE");
+
+struct prima_profile_state {
+    uint64_t ubatch   = 0;
+    uint32_t rank     = 0;
+    size_t   subgraph = 0;
+    int      node     = 0;
+    int64_t  t_start  = 0;
+};
+
+static prima_profile_state prima_profile;
+
+static std::ofstream & prima_profile_csv() {
+    static std::ofstream csv_out;
+    static bool initialized = false;
+    if (!initialized) {
+        initialized = true;
+        std::ifstream existing(PRIMA_PROFILE, std::ios::ate);
+        const bool have_header = existing.is_open() && existing.tellg() > 0;
+        csv_out.open(PRIMA_PROFILE, std::ios::app);
+        if (!have_header) {
+            csv_out << "ubatch,rank,subgraph,node,backend,op,name,"
+                       "src0_ne0,src0_ne1,src0_ne2,src0_ne3,"
+                       "src1_ne0,src1_ne1,src1_ne2,src1_ne3,"
+                       "dst_ne0,dst_ne1,dst_ne2,dst_ne3,elapsed_us\n";
+        }
+    }
+    return csv_out;
+}
+
+// writes a tensor's 4 dimensions as CSV fields, or four 0s if the tensor doesn't exist
+static void prima_profile_write_ne(std::ofstream & out, const ggml_tensor * t) {
+    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+        out << (t ? t->ne[d] : 0) << ',';
+    }
+}
+
+// one CSV row; node is -1 and backend is empty for rows that are not a single graph node
+static void prima_profile_write_row(int node, const char * backend, const char * op, const char * name,
+                                    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int64_t elapsed_us) {
+    std::ofstream & csv = prima_profile_csv();
+    csv << prima_profile.ubatch << ',' << prima_profile.rank << ',' << prima_profile.subgraph << ','
+        << node << ',' << backend << ',' << op << ',' << name << ',';
+    prima_profile_write_ne(csv, src0);
+    prima_profile_write_ne(csv, src1);
+    prima_profile_write_ne(csv, dst);
+    csv << elapsed_us << '\n';
+}
+
+// asking for every node makes ggml_backend_sched_compute_splits run each node alone and synchronize
+// before calling back, so the time between the two calls is that node's time
+static bool prima_profile_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    GGML_UNUSED(user_data);
+    if (ask) {
+        prima_profile.t_start = ggml_time_us();
+        return true;
+    }
+    const int64_t elapsed_us = ggml_time_us() - prima_profile.t_start;
+    prima_profile_write_row(prima_profile.node++, t->buffer ? ggml_backend_buffer_name(t->buffer) : "",
+                            ggml_op_name(t->op), t->name, t->src[0], t->src[1], t, elapsed_us);
+    return true;
+}
+
 static void llama_graph_compute(
           llama_context & lctx,
             ggml_cgraph * gf,
@@ -18454,7 +18521,15 @@ static int llama_decode_internal(
 
         for (size_t i = 0; i < lctx.sched.size(); i++) {
             ggml_backend_sched_reset(lctx.sched[i]);
-            ggml_backend_sched_set_eval_callback(lctx.sched[i], lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+            if (PRIMA_PROFILE) {
+                ggml_backend_sched_set_eval_callback(lctx.sched[i], prima_profile_eval_cb, nullptr);
+            } else {
+                ggml_backend_sched_set_eval_callback(lctx.sched[i], lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+            }
+        }
+        if (PRIMA_PROFILE) {
+            prima_profile.ubatch++;
+            prima_profile.rank = my_rank;
         }
 
         std::vector<ggml_cgraph *> gf = llama_build_graph(lctx, ubatch, false);
@@ -18503,10 +18578,17 @@ static int llama_decode_internal(
         for (size_t i = 0; i < (size_t)gf.size(); ++i) {
             const bool is_out_embd = my_rank == 0 && i == (size_t)gf.size() - 1;
             sub_gf = gf[i];
+            prima_profile.subgraph = i;
+            prima_profile.node     = 0;
 
             // receive data from other nodes
             if (n_world > 1 && !(my_rank == 0 && i == 0) && !(my_rank == 0 && is_last_l)) {
+                const int64_t t_recv = ggml_time_us();
                 llama_recv_tensors(*lctx.recv_socket, &ubatch, is_out_embd);
+                if (PRIMA_PROFILE) {
+                    // includes the time spent waiting for the previous node
+                    prima_profile_write_row(-1, "", "ZMQ_RECV", "sub_gf_out", nullptr, nullptr, nullptr, ggml_time_us() - t_recv);
+                }
             }
 
             // ensure ggml_backend_tensor_get_async of the previous subgraph has finished
@@ -18522,7 +18604,14 @@ static int llama_decode_internal(
 
             {   // compute graph
                 timer(llama_graph_compute);
-                llama_graph_compute(lctx, sub_gf, lctx.sched[i], n_threads, threadpool); 
+                const int64_t t_compute = ggml_time_us();
+                llama_graph_compute(lctx, sub_gf, lctx.sched[i], n_threads, threadpool);
+                if (PRIMA_PROFILE) {
+                    // minus the sum of the node rows = split input copies and scheduler overhead
+                    ggml_backend_sched_synchronize(lctx.sched[i]);
+                    prima_profile_write_row(-1, "", "SUBGRAPH", ggml_graph_node(sub_gf, -1)->name,
+                                            nullptr, nullptr, nullptr, ggml_time_us() - t_compute);
+                }
             }
 
             sub_gf_out = ggml_graph_node(sub_gf, -1);
@@ -18552,15 +18641,25 @@ static int llama_decode_internal(
             ggml_backend_t backend  = ggml_backend_sched_get_tensor_backend(lctx.sched[i], sub_gf_out);
             GGML_ASSERT(buf_size <= ggml_nbytes(sub_gf_out));
             GGML_ASSERT(backend  != nullptr);
+            const int64_t t_copy = ggml_time_us();
             ggml_backend_tensor_get_async(backend, sub_gf_out, embd_buf, 0, buf_size);
             ggml_backend_sched_synchronize(lctx.sched[i]);
+            if (PRIMA_PROFILE) {
+                prima_profile_write_row(-1, ggml_backend_name(backend), "D2H_COPY", sub_gf_out->name,
+                                        nullptr, nullptr, sub_gf_out, ggml_time_us() - t_copy);
+            }
 
             // send the result to the next node or the master
             if (!(n_world == 1 || (my_rank == 0 && is_last_l))) {
                 struct input_tensors tensors = {sub_gf_out, lctx.inp_pos};
                 const bool is_to_master = my_rank != 0 && is_last_l;
                 zmq::socket_t * s = is_to_master ? lctx.master_socket : lctx.send_socket;
+                const int64_t t_send = ggml_time_us();
                 llama_send_tensors(*s, &ubatch, &tensors);
+                if (PRIMA_PROFILE) {
+                    prima_profile_write_row(-1, "", "ZMQ_SEND", sub_gf_out->name,
+                                            nullptr, nullptr, sub_gf_out, ggml_time_us() - t_send);
+                }
             }
 
             // overlap memory scheduling with other nodes' communication and computing
@@ -18573,6 +18672,10 @@ static int llama_decode_internal(
                     manage_graph_tensors(gf[0], POSIX_MADV_WILLNEED, cparams.force);
                 }
             }
+        }
+
+        if (PRIMA_PROFILE) {
+            prima_profile_csv().flush();
         }
 
         // update the kv ring buffer
