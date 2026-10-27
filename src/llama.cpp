@@ -18293,6 +18293,63 @@ static void manage_graph_tensors(struct ggml_cgraph * cgraph, int advice, bool f
 // return positive int on warning
 // return negative int on error
 //
+// pipelined prefill: the layers start at rank 1 and rank 0 holds the last window, so rank 0's first
+// subgraph only embeds the input. With one window per rank (k=1), rank 0 sends the input embeddings of
+// all ubatches up front. Like llama.cpp's pipeline parallelism, several ubatches are then in flight and
+// the other ranks work on the next ubatch while rank 0 runs its window. returns false if not applicable
+static bool llama_send_inputs_ahead(llama_context & lctx, const llama_batch & batch_all, bool logits_all) {
+    const auto & cparams = lctx.cparams;
+    auto       & kv_self = lctx.kv_self;
+
+    llama_sbatch sbatch;
+    sbatch.from_batch(batch_all, lctx.model.hparams.n_embd, /* simple_split */ true, logits_all);
+
+    // the layer subgraphs are built but not computed here, give them a valid KV size
+    const uint32_t pad = llama_kv_cache_get_padding(cparams);
+    kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(llama_kv_cache_cell_max(kv_self), pad)));
+
+    bool first = true;
+    while (sbatch.n_tokens > 0) {
+        llama_ubatch ubatch = sbatch.split_simple(cparams.n_ubatch);
+
+        int32_t n_outputs = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+            n_outputs += ubatch.output[i] != 0;
+        }
+        lctx.n_outputs = n_outputs;
+
+        for (auto * sched : lctx.sched) {
+            ggml_backend_sched_reset(sched);
+        }
+        std::vector<ggml_cgraph *> gf = llama_build_graph(lctx, ubatch, false);
+        struct ggml_tensor * inp_embd = ggml_graph_node(gf[0], -1);
+        if (first) {
+            // [inp_embd, my window, output] means one window per rank
+            if (gf.size() != 3 || strcmp(inp_embd->name, "inp_embd") != 0) {
+                return false;
+            }
+            first = false;
+        }
+        ggml_backend_sched_alloc_graph(lctx.sched[0], gf[0]);
+
+        if (ubatch.token) {
+            ggml_backend_tensor_set(lctx.inp_tokens, ubatch.token, 0, ubatch.n_tokens * ggml_element_size(lctx.inp_tokens));
+        }
+        if (ubatch.embd) {
+            ggml_backend_tensor_set(lctx.inp_embd, ubatch.embd, 0, ggml_nbytes(lctx.inp_embd));
+        }
+        llama_graph_compute(lctx, gf[0], lctx.sched[0], cparams.n_threads_batch, lctx.threadpool_batch);
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(lctx.sched[0], inp_embd);
+        ggml_backend_tensor_get_async(backend, inp_embd, ubatch.backend_embd, 0, inp_embd->ne[0] * inp_embd->ne[1] * sizeof(float));
+        ggml_backend_sched_synchronize(lctx.sched[0]);
+
+        struct input_tensors tensors = {inp_embd, lctx.inp_pos};
+        llama_send_tensors(*lctx.send_socket, &ubatch, &tensors);
+    }
+    return true;
+}
+
 static int llama_decode_internal(
          llama_context & lctx,
            llama_batch   batch_all,
@@ -18463,6 +18520,11 @@ static int llama_decode_internal(
         return -2;
     };
 
+    bool inputs_sent = false;
+    if (my_rank == 0 && n_world > 1 && n_tokens_all > n_ubatch && !kv_self.recurrent && !embd_pooled) {
+        inputs_sent = llama_send_inputs_ahead(lctx, batch_all, n_outputs == n_tokens_all);
+    }
+
     while (lctx.sbatch.n_tokens > 0) { // handle multiple batches
         llama_ubatch ubatch;
         if (kv_self.recurrent) {
@@ -18581,6 +18643,18 @@ static int llama_decode_internal(
             prima_profile.subgraph = i;
             prima_profile.node     = 0;
 
+            // like llama.cpp, the output layer only runs for ubatches that need outputs. During prompt
+            // processing that is only the last ubatch, so the last worker does not send the others back
+            // and the master can push the next ubatch into the ring without waiting (pipelined prefill)
+            // already sent by llama_send_inputs_ahead
+            if (inputs_sent && i == 0) {
+                continue;
+            }
+
+            if (is_out_embd && n_world > 1 && lctx.n_outputs == 0) {
+                break;
+            }
+
             // receive data from other nodes
             if (n_world > 1 && !(my_rank == 0 && i == 0) && !(my_rank == 0 && is_last_l)) {
                 const int64_t t_recv = ggml_time_us();
@@ -18650,9 +18724,9 @@ static int llama_decode_internal(
             }
 
             // send the result to the next node or the master
-            if (!(n_world == 1 || (my_rank == 0 && is_last_l))) {
+            const bool is_to_master = my_rank != 0 && is_last_l;
+            if (!(n_world == 1 || (my_rank == 0 && is_last_l)) && !(is_to_master && lctx.n_outputs == 0)) {
                 struct input_tensors tensors = {sub_gf_out, lctx.inp_pos};
-                const bool is_to_master = my_rank != 0 && is_last_l;
                 zmq::socket_t * s = is_to_master ? lctx.master_socket : lctx.send_socket;
                 const int64_t t_send = ggml_time_us();
                 llama_send_tensors(*s, &ubatch, &tensors);
