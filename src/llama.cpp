@@ -17899,7 +17899,10 @@ struct sync_meta {
     llama_pos all_pos_0;
     llama_pos all_pos_1;
     uint32_t  n_ctx          = 0;
-    
+
+    // rank 0 decides whether this batch runs the pipelined (window-major) schedule, every rank must agree
+    bool pipelined             = false;
+
     // signal to clear the kv cache
     bool clear_kv_cache        = false;
 
@@ -17977,6 +17980,9 @@ static void llama_send_meta(zmq::socket_t & socket, struct sync_meta * meta, boo
 
         send_msgs.emplace_back("all_pos_1", strlen("all_pos_1"));
         send_msgs.emplace_back(&(meta->all_pos_1), sizeof(meta->all_pos_1));
+
+        send_msgs.emplace_back("pipelined", strlen("pipelined"));
+        send_msgs.emplace_back(&(meta->pipelined), sizeof(meta->pipelined));
 
         zmq::send_multipart(socket, send_msgs);
     } catch (const zmq::error_t& e) {
@@ -18090,6 +18096,11 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta) {
         if (key == "all_pos_1") {
             GGML_ASSERT(data_msg.size() == sizeof(meta->all_pos_1));
             std::memcpy(&(meta->all_pos_1), data_msg.data(), sizeof(meta->all_pos_1));
+        }
+
+        if (key == "pipelined") {
+            GGML_ASSERT(data_msg.size() == sizeof(meta->pipelined));
+            std::memcpy(&(meta->pipelined), data_msg.data(), sizeof(meta->pipelined));
         }
     }
     return 0;
@@ -18293,61 +18304,21 @@ static void manage_graph_tensors(struct ggml_cgraph * cgraph, int advice, bool f
 // return positive int on warning
 // return negative int on error
 //
-// pipelined prefill: the layers start at rank 1 and rank 0 holds the last window, so rank 0's first
-// subgraph only embeds the input. With one window per rank (k=1), rank 0 sends the input embeddings of
-// all ubatches up front. Like llama.cpp's pipeline parallelism, several ubatches are then in flight and
-// the other ranks work on the next ubatch while rank 0 runs its window. returns false if not applicable
-static bool llama_send_inputs_ahead(llama_context & lctx, const llama_batch & batch_all, bool logits_all) {
-    const auto & cparams = lctx.cparams;
-    auto       & kv_self = lctx.kv_self;
-
-    llama_sbatch sbatch;
-    sbatch.from_batch(batch_all, lctx.model.hparams.n_embd, /* simple_split */ true, logits_all);
-
-    // the layer subgraphs are built but not computed here, give them a valid KV size
-    const uint32_t pad = llama_kv_cache_get_padding(cparams);
-    kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(llama_kv_cache_cell_max(kv_self), pad)));
-
-    bool first = true;
-    while (sbatch.n_tokens > 0) {
-        llama_ubatch ubatch = sbatch.split_simple(cparams.n_ubatch);
-
-        int32_t n_outputs = 0;
-        for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-            n_outputs += ubatch.output[i] != 0;
+// a token goes around the ring once per layer window each rank owns. The pipelined prefill below needs
+// every rank to own exactly one window per lap and rank 0 to own the last layer, which holds when the
+// windows tile the layers evenly. returns the number of windows, or 0 for any other layer assignment
+static uint32_t llama_count_layer_windows(uint32_t n_layer, uint32_t n_world, const uint32_t * n_layer_window) {
+    uint32_t total = 0;
+    for (uint32_t rank = 0; rank < n_world; ++rank) {
+        if (n_layer_window[rank] == 0) {
+            return 0;
         }
-        lctx.n_outputs = n_outputs;
-
-        for (auto * sched : lctx.sched) {
-            ggml_backend_sched_reset(sched);
-        }
-        std::vector<ggml_cgraph *> gf = llama_build_graph(lctx, ubatch, false);
-        struct ggml_tensor * inp_embd = ggml_graph_node(gf[0], -1);
-        if (first) {
-            // [inp_embd, my window, output] means one window per rank
-            if (gf.size() != 3 || strcmp(inp_embd->name, "inp_embd") != 0) {
-                return false;
-            }
-            first = false;
-        }
-        ggml_backend_sched_alloc_graph(lctx.sched[0], gf[0]);
-
-        if (ubatch.token) {
-            ggml_backend_tensor_set(lctx.inp_tokens, ubatch.token, 0, ubatch.n_tokens * ggml_element_size(lctx.inp_tokens));
-        }
-        if (ubatch.embd) {
-            ggml_backend_tensor_set(lctx.inp_embd, ubatch.embd, 0, ggml_nbytes(lctx.inp_embd));
-        }
-        llama_graph_compute(lctx, gf[0], lctx.sched[0], cparams.n_threads_batch, lctx.threadpool_batch);
-
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(lctx.sched[0], inp_embd);
-        ggml_backend_tensor_get_async(backend, inp_embd, ubatch.backend_embd, 0, inp_embd->ne[0] * inp_embd->ne[1] * sizeof(float));
-        ggml_backend_sched_synchronize(lctx.sched[0]);
-
-        struct input_tensors tensors = {inp_embd, lctx.inp_pos};
-        llama_send_tensors(*lctx.send_socket, &ubatch, &tensors);
+        total += n_layer_window[rank];
     }
-    return true;
+    if (n_layer % total != 0) {
+        return 0;
+    }
+    return n_layer / total;
 }
 
 static int llama_decode_internal(
@@ -18499,6 +18470,19 @@ static int llama_decode_internal(
         }
     }
 
+    // pipelined prefill: process the batch window-major, all ubatches through one layer window before
+    // moving to the next, instead of sending each ubatch around the whole ring on its own. Rank 0 then
+    // embeds every ubatch up front and the ranks work on different ubatches at the same time, the way
+    // llama.cpp's pipeline parallelism keeps several ubatches in flight across the GPUs of one machine.
+    // Every rank walks its windows in the same order, so the tensors still arrive in the order they are
+    // consumed and no tagging is needed. Only rank 0 decides, the workers follow what it put in the meta
+    const uint32_t n_windows = llama_count_layer_windows(hparams.n_layer, n_world, cparams.n_layer_window);
+    if (my_rank == 0) {
+        meta.pipelined = n_world > 1 && n_windows > 0 && (uint32_t) batch_all.n_tokens > n_ubatch
+                      && !kv_self.recurrent && !embd_pooled;
+    }
+    const bool pipelined = meta.pipelined;
+
     if (!is_last_dev) {
         meta.n_tokens  = batch_all.n_tokens;
         meta.pos       = batch_all.pos;
@@ -18508,8 +18492,8 @@ static int llama_decode_internal(
         meta.all_pos_0 = batch_all.all_pos_0;
         meta.all_pos_1 = batch_all.all_pos_1;
         llama_send_meta(*lctx.send_socket, &meta, server_mode);
-    } 
-    
+    }
+
     lctx.sbatch.from_batch(batch_all, n_embd,
         /* simple_split */ !kv_self.recurrent,
         /* logits_all   */ n_outputs == n_tokens_all);
@@ -18520,10 +18504,49 @@ static int llama_decode_internal(
         return -2;
     };
 
-    bool inputs_sent = false;
-    if (my_rank == 0 && n_world > 1 && n_tokens_all > n_ubatch && !kv_self.recurrent && !embd_pooled) {
-        inputs_sent = llama_send_inputs_ahead(lctx, batch_all, n_outputs == n_tokens_all);
+    // window-major means a ubatch is revisited in a later pass, so its KV cells are claimed here instead
+    // of inside the loop. A ubatch then sees the cells of the ones after it, but the causal mask hides
+    // them: find_slot has already stamped those cells with positions greater than its own
+    std::vector<uint32_t> kv_heads;
+    std::vector<uint32_t> kv_ns;
+    uint32_t kv_head_after = kv_self.head;
+    uint32_t kv_n_after    = kv_self.n;
+    if (pipelined && hparams.causal_attn) {
+        llama_kv_cache_update(&lctx);
+        while (lctx.sbatch.n_tokens > 0) {
+            llama_ubatch ubatch = lctx.sbatch.split_simple(n_ubatch);
+
+            if (kv_self.head > kv_self.used + 2 * ubatch.n_tokens) {
+                kv_self.head = 0;
+            }
+            if (!llama_kv_cache_find_slot(kv_self, ubatch)) {
+                return 1;
+            }
+            const uint32_t pad = llama_kv_cache_get_padding(cparams);
+            kv_heads.push_back(kv_self.head);
+            kv_ns.push_back(std::min(kv_self.size, std::max(pad, GGML_PAD(llama_kv_cache_cell_max(kv_self), pad))));
+
+            kv_self.head += ubatch.n_tokens;
+            if (kv_self.head >= kv_self.size) {
+                kv_self.head = 0;
+            }
+        }
+        kv_head_after = kv_self.head;
+        kv_n_after    = kv_ns.back();
     }
+
+    // rank 0 owns one extra pass for the input embeddings, which it computes before any layer window
+    const uint32_t n_passes   = !pipelined ? 1 : (my_rank == 0 ? n_windows + 1 : n_windows);
+    const uint32_t final_pass = n_passes - 1;
+
+    const uint64_t profile_ubatch_base = prima_profile.ubatch;
+    size_t i_ubatch = 0;
+
+    for (uint32_t pass = 0; pass < n_passes; ++pass) { // one pass per layer window, body left un-indented
+    i_ubatch = 0;
+    lctx.sbatch.from_batch(batch_all, n_embd,
+        /* simple_split */ !kv_self.recurrent,
+        /* logits_all   */ n_outputs == n_tokens_all);
 
     while (lctx.sbatch.n_tokens > 0) { // handle multiple batches
         llama_ubatch ubatch;
@@ -18559,7 +18582,12 @@ static int llama_decode_internal(
         GGML_ASSERT(n_threads > 0);
 
         // non-causal masks do not use the KV cache
-        if (hparams.causal_attn) {
+        if (hparams.causal_attn && pipelined) {
+            // the slot was claimed before the pass loop, restore it so the graph writes to the same cells
+            GGML_ASSERT(i_ubatch < kv_heads.size());
+            kv_self.head = kv_heads[i_ubatch];
+            kv_self.n    = kv_ns[i_ubatch];
+        } else if (hparams.causal_attn) {
             llama_kv_cache_update(&lctx);
 
             // if we have enough unused cells before the current head ->
@@ -18590,8 +18618,8 @@ static int llama_decode_internal(
             }
         }
         if (PRIMA_PROFILE) {
-            prima_profile.ubatch++;
-            prima_profile.rank = my_rank;
+            prima_profile.ubatch = profile_ubatch_base + i_ubatch;
+            prima_profile.rank   = my_rank;
         }
 
         std::vector<ggml_cgraph *> gf = llama_build_graph(lctx, ubatch, false);
@@ -18636,8 +18664,18 @@ static int llama_decode_internal(
         bool           is_output = false;
         bool           is_last_l = false;
         GGML_ASSERT(my_rank == 0 || n_world > 1);
-        
-        for (size_t i = 0; i < (size_t)gf.size(); ++i) {
+
+        // one pass runs one subgraph per ubatch: rank 0's pass 0 is the input embedding and pass p the
+        // window before it, a worker's pass p is its window p. The last pass also runs the output layer
+        size_t i_begin = 0;
+        size_t i_end   = gf.size();
+        if (pipelined) {
+            GGML_ASSERT(gf.size() == (my_rank == 0 ? n_windows + 2 : n_windows));
+            i_begin = pass;
+            i_end   = (pass == final_pass) ? gf.size() : pass + 1;
+        }
+
+        for (size_t i = i_begin; i < i_end; ++i) {
             const bool is_out_embd = my_rank == 0 && i == (size_t)gf.size() - 1;
             sub_gf = gf[i];
             prima_profile.subgraph = i;
@@ -18646,11 +18684,6 @@ static int llama_decode_internal(
             // like llama.cpp, the output layer only runs for ubatches that need outputs. During prompt
             // processing that is only the last ubatch, so the last worker does not send the others back
             // and the master can push the next ubatch into the ring without waiting (pipelined prefill)
-            // already sent by llama_send_inputs_ahead
-            if (inputs_sent && i == 0) {
-                continue;
-            }
-
             if (is_out_embd && n_world > 1 && lctx.n_outputs == 0) {
                 break;
             }
@@ -18736,10 +18769,11 @@ static int llama_decode_internal(
                 }
             }
 
-            // overlap memory scheduling with other nodes' communication and computing
-            if (cparams.prefetch && n_world > 1) {
+            // overlap memory scheduling with other nodes' communication and computing. The weights of a
+            // window are reused by every ubatch of a pass, so advise once the pass is about to end
+            if (cparams.prefetch && n_world > 1 && (!pipelined || lctx.sbatch.n_tokens == 0)) {
                 timer(manage_graph_tensors);
-                
+
                 int next_gf_id = (i + 1) % gf.size();
                 manage_graph_tensors(gf[next_gf_id], POSIX_MADV_WILLNEED, cparams.force);
                 if (my_rank == 0 && (is_last_l || (next_gf_id == (int)gf.size() - 1))) {
@@ -18753,7 +18787,7 @@ static int llama_decode_internal(
         }
 
         // update the kv ring buffer
-        {
+        if (!pipelined) {
             kv_self.head += n_tokens;
 
             // Ensure kv cache head points to a valid index.
@@ -18763,7 +18797,7 @@ static int llama_decode_internal(
         }
 
         // extract logits
-        if (res) {
+        if (res && pass == final_pass) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched.back(), res);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(lctx.logits != nullptr);
@@ -18835,7 +18869,19 @@ static int llama_decode_internal(
                     }
             }
         }
-        n_outputs_prev += lctx.n_outputs;
+        if (pass == final_pass) {
+            n_outputs_prev += lctx.n_outputs;
+        }
+        i_ubatch++;
+    }
+    } // pass
+
+    if (pipelined) {
+        prima_profile.ubatch = profile_ubatch_base + i_ubatch;
+        if (hparams.causal_attn) {
+            kv_self.head = kv_head_after;
+            kv_self.n    = kv_n_after;
+        }
     }
 
     if (my_rank == 0) {

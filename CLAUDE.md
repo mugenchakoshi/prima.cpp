@@ -66,6 +66,7 @@ Almost everything prima adds is in three files. `ggml/` is mostly upstream.
     - It receives the input from the previous rank over `recv_socket` and computes.
     - It sends the result to the next rank. After the last layer, a worker sends to `master_socket`, and rank 0 runs the output layer.
     - Before moving on, it calls `manage_graph_tensors(..., POSIX_MADV_WILLNEED)` to prefetch the next window.
+  - Pipelined prefill: when a batch has more than one ubatch, the loop runs window-major instead. An outer pass loop walks the layer windows and the ubatch loop sits inside it, so every rank pushes all ubatches through one window before starting the next and the ranks work on different ubatches at the same time. Every rank walks its windows in the same order, so tensors arrive in the order they are consumed. Rank 0 decides (`meta.pipelined`), KV slots for all ubatches are claimed before the pass loop, and `llama_count_layer_windows` disables it unless the windows tile the layers evenly. Single-token decode is unaffected.
 - **`include/llama.h`**: the public API additions for all of the above (`llama_profile_device`, `llama_update_context_with_rankworld`, etc.).
 
 ## Profiling (current branch)
