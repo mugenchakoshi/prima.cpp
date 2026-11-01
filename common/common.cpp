@@ -1740,8 +1740,8 @@ static float predict_prefill_ms(
     if (W == 0) {
         return -1.0f;
     }
+    const uint32_t k     = n_layer % W == 0 ? n_layer / W : 1;
     const bool     tiled = n_layer % W == 0 && ring.size() > 1;
-    const uint32_t k     = tiled ? n_layer / W : 1;
 
     // per-device time of one window pass for a ubatch of n tokens whose last KV cell is at kv
     auto window_ms = [&](uint32_t m, int n, int kv) {
