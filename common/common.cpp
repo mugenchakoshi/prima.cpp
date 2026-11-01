@@ -1656,6 +1656,193 @@ static bool assign_layers_and_select_devices(
     return true;
 }
 
+// time in ms to compute one token through one layer (or the output layer) on the CPU or GPU of a device,
+// from the per-token model FLOPs and the profiled matmul FLOPS of each weight type
+static float device_token_compute_ms(const device_info & dev, const model_flops & mf, bool gpu, bool output) {
+    using flops_t = int64_t model_flops::*;
+    static const flops_t layer_f[] = {
+        &model_flops::layer_f32_f32, &model_flops::layer_f16_f32, &model_flops::layer_q2k_f32, &model_flops::layer_q4k_f32,
+        &model_flops::layer_q5k_f32, &model_flops::layer_q6k_f32, &model_flops::layer_iq2xxs_f32, &model_flops::layer_q50_f32,
+        &model_flops::layer_q80_f32, &model_flops::layer_iq1s_f32, &model_flops::layer_iq4nl_f32, &model_flops::layer_iq1m_f32,
+    };
+    static const flops_t output_f[] = {
+        &model_flops::output_f32_f32, &model_flops::output_f16_f32, &model_flops::output_q2k_f32, &model_flops::output_q4k_f32,
+        &model_flops::output_q5k_f32, &model_flops::output_q6k_f32, &model_flops::output_iq2xxs_f32, &model_flops::output_q50_f32,
+        &model_flops::output_q80_f32, &model_flops::output_iq1s_f32, &model_flops::output_iq4nl_f32, &model_flops::output_iq1m_f32,
+    };
+    static float cpu_props::* const cpu_f[] = {
+        &cpu_props::flops_f32_f32, &cpu_props::flops_f16_f32, &cpu_props::flops_q2k_f32, &cpu_props::flops_q4k_f32,
+        &cpu_props::flops_q5k_f32, &cpu_props::flops_q6k_f32, &cpu_props::flops_iq2xxs_f32, &cpu_props::flops_q50_f32,
+        &cpu_props::flops_q80_f32, &cpu_props::flops_iq1s_f32, &cpu_props::flops_iq4nl_f32, &cpu_props::flops_iq1m_f32,
+    };
+    static float gpu_props::* const cuda_f[] = {
+        &gpu_props::cuda_flops_f32_f32, &gpu_props::cuda_flops_f16_f32, &gpu_props::cuda_flops_q2k_f32, &gpu_props::cuda_flops_q4k_f32,
+        &gpu_props::cuda_flops_q5k_f32, &gpu_props::cuda_flops_q6k_f32, &gpu_props::cuda_flops_iq2xxs_f32, &gpu_props::cuda_flops_q50_f32,
+        &gpu_props::cuda_flops_q80_f32, &gpu_props::cuda_flops_iq1s_f32, &gpu_props::cuda_flops_iq4nl_f32, &gpu_props::cuda_flops_iq1m_f32,
+    };
+    static float gpu_props::* const metal_f[] = {
+        &gpu_props::metal_flops_f32_f32, &gpu_props::metal_flops_f16_f32, &gpu_props::metal_flops_q2k_f32, &gpu_props::metal_flops_q4k_f32,
+        &gpu_props::metal_flops_q5k_f32, &gpu_props::metal_flops_q6k_f32, &gpu_props::metal_flops_iq2xxs_f32, &gpu_props::metal_flops_q50_f32,
+        &gpu_props::metal_flops_q80_f32, &gpu_props::metal_flops_iq1s_f32, &gpu_props::metal_flops_iq4nl_f32, &gpu_props::metal_flops_iq1m_f32,
+    };
+
+    double ms = 0.0;
+    for (size_t i = 0; i < sizeof(layer_f) / sizeof(layer_f[0]); ++i) {
+        const int64_t f = mf.*(output ? output_f[i] : layer_f[i]);
+        float flops;
+        if (!gpu) {
+            flops = dev.cpu_props.*cpu_f[i];
+        } else if (dev.gpu_support.metal) {
+            flops = dev.gpu_props.*metal_f[i];
+        } else {
+            flops = dev.gpu_props.*cuda_f[i];
+        }
+        ms += f / (flops * 1e9 + EPS) * 1000;
+    }
+    return ms;
+}
+
+// predicted prompt processing (prefill) time in ms for a layer assignment, mirroring llama_decode_internal.
+// The prompt reaches llama_decode in n_batch chunks and each chunk is split into n_ubatch ubatches. When
+// the chunk is pipelined, it runs window-major: rank 0 embeds every ubatch, then the layer windows follow
+// in ring order (rank 1, 2, ..., 0, once per cycle), and a device runs all ubatches through one window
+// before its next one. Each stage starts a ubatch once its device is free and the previous stage has
+// finished that ubatch. Otherwise each ubatch goes around the whole ring alone (serial_ms is this old
+// schedule for every chunk, for comparison).
+// Prefill is compute-bound, so the per-token layer FLOPs are scaled by the ubatch size, plus attention
+// over the KV cells filled so far and one weight read per ubatch. Layers that do not fit in RAM are read
+// from disk once per window pass. Communication is ignored, there is no network profiling yet
+static float predict_prefill_ms(
+                                uint32_t   n_world,
+                       const device_info * dev_info_set,
+                          const uint32_t * n_layer_window,
+                          const uint32_t * n_gpu_layers,
+                      struct llama_model * model,
+       const struct llama_context_params & cparams,
+                                     int   n_prompt,
+                                   float * serial_ms) {
+    const model_flops & mf      = dev_info_set[0].model_flops;
+    const int64_t       b       = dev_info_set[0].model_bytes.nb_layer;
+    const int64_t       bo      = dev_info_set[0].model_bytes.nb_output;
+    const uint32_t      n_layer = llama_model_n_layers(model);
+    const int64_t       n_embd  = llama_n_embd(model);
+
+    // devices in ring order: the layers start at rank 1 and rank 0 holds the last window of each cycle
+    std::vector<uint32_t> ring;
+    uint32_t W = 0;
+    for (uint32_t i = 1; i <= n_world; ++i) {
+        const uint32_t m = i % n_world;
+        if (n_layer_window[m] > 0) {
+            ring.push_back(m);
+            W += n_layer_window[m];
+        }
+    }
+    if (W == 0) {
+        return -1.0f;
+    }
+    const bool     tiled = n_layer % W == 0 && ring.size() > 1;
+    const uint32_t k     = tiled ? n_layer / W : 1;
+
+    // per-device time of one window pass for a ubatch of n tokens whose last KV cell is at kv
+    auto window_ms = [&](uint32_t m, int n, int kv) {
+        const device_info & dev = dev_info_set[m];
+        const bool has_gpu  = dev.gpu_support.cuda || dev.gpu_support.metal;
+        const int  n_gpu    = has_gpu ? std::min(n_gpu_layers[m], n_layer_window[m]) : 0;
+        const int  n_cpu    = n_layer_window[m] - n_gpu;
+        const double attn   = 4.0 * n_embd * kv * n; // KQ and KQV
+        double ms = n_cpu * (n * device_token_compute_ms(dev, mf, false, false)
+                             + attn / (dev.cpu_props.flops_f16_f32 * 1e9 + EPS) * 1000
+                             + b / (dev.memory.cpu_read_ram_bw * 1e9 + EPS) * 1000);
+        if (n_gpu > 0) {
+            const float gpu_f16 = dev.gpu_support.metal ? dev.gpu_props.metal_flops_f16_f32 : dev.gpu_props.cuda_flops_f16_f32;
+            const float gpu_bw  = dev.gpu_support.metal ? dev.gpu_props.metal_read_vram_bw  : dev.gpu_props.cuda_read_vram_bw;
+            ms += n_gpu * (n * device_token_compute_ms(dev, mf, true, false)
+                           + attn / (gpu_f16 * 1e9 + EPS) * 1000
+                           + b / (gpu_bw * 1e9 + EPS) * 1000);
+        }
+        return ms;
+    };
+
+    // disk reads per window pass: the CPU layers of a device that do not fit in its available RAM
+    std::vector<double> disk_ms(n_world, 0.0);
+    for (uint32_t m : ring) {
+        const device_info & dev = dev_info_set[m];
+        const bool    has_gpu = dev.gpu_support.cuda || dev.gpu_support.metal;
+        const int64_t cpu_l   = (int64_t)(n_layer_window[m] - (has_gpu ? std::min(n_gpu_layers[m], n_layer_window[m]) : 0)) * k;
+        const double  spill   = std::max(0.0, (double)cpu_l * b - dev.memory.available_physical * GIGABYTE);
+        const float   disk_bw = strcmp(dev.device_os, "Linux") == 0 ? dev.disk.read_seq_bw : dev.disk.read_rnd_bw;
+        disk_ms[m] = spill / k / (disk_bw * 1e9 + EPS) * 1000;
+    }
+
+    // the output layer runs for the last token of the prompt only
+    const device_info & master = dev_info_set[0];
+    double out_ms;
+    if (cparams.keep_out_in_cuda && master.gpu_support.cuda) {
+        out_ms = device_token_compute_ms(master, mf, true, true) + bo / (master.gpu_props.cuda_read_vram_bw * 1e9 + EPS) * 1000;
+    } else {
+        out_ms = device_token_compute_ms(master, mf, false, true) + bo / (master.memory.cpu_read_ram_bw * 1e9 + EPS) * 1000;
+    }
+
+    double t_pipe = 0.0, t_serial = 0.0;
+    for (int pos = 0; pos < n_prompt; pos += cparams.n_batch) {
+        const int n_chunk = std::min<int>(cparams.n_batch, n_prompt - pos);
+
+        std::vector<int> ub_n, ub_kv;
+        for (int i = 0; i < n_chunk; i += cparams.n_ubatch) {
+            ub_n.push_back(std::min<int>(cparams.n_ubatch, n_chunk - i));
+            ub_kv.push_back(pos + i + ub_n.back());
+        }
+        const size_t n_ub = ub_n.size();
+
+        // old schedule: every ubatch goes around the ring alone
+        for (size_t u = 0; u < n_ub; ++u) {
+            t_serial += master.model_flops.inp_embd_ms * ub_n[u];
+            for (uint32_t c = 0; c < k; ++c) {
+                for (uint32_t m : ring) {
+                    t_serial += disk_ms[m] + window_ms(m, ub_n[u], ub_kv[u]);
+                }
+            }
+        }
+        t_serial += out_ms;
+
+        if (!tiled || n_ub == 1) {
+            // not pipelined, same as the old schedule for this chunk
+            for (size_t u = 0; u < n_ub; ++u) {
+                t_pipe += master.model_flops.inp_embd_ms * ub_n[u];
+                for (uint32_t c = 0; c < k; ++c) {
+                    for (uint32_t m : ring) {
+                        t_pipe += disk_ms[m] + window_ms(m, ub_n[u], ub_kv[u]);
+                    }
+                }
+            }
+            t_pipe += out_ms;
+            continue;
+        }
+
+        // window-major: simulate when each stage finishes each ubatch
+        std::vector<double> dev_free(n_world, t_pipe), done(n_ub, t_pipe);
+        for (size_t u = 0; u < n_ub; ++u) {
+            dev_free[0] += master.model_flops.inp_embd_ms * ub_n[u];
+            done[u] = dev_free[0];
+        }
+        for (uint32_t c = 0; c < k; ++c) {
+            for (uint32_t m : ring) {
+                dev_free[m] += disk_ms[m];
+                for (size_t u = 0; u < n_ub; ++u) {
+                    dev_free[m] = std::max(dev_free[m], done[u]) + window_ms(m, ub_n[u], ub_kv[u]);
+                    done[u] = dev_free[m];
+                }
+            }
+        }
+        t_pipe = done[n_ub - 1] + out_ms;
+    }
+
+    if (serial_ms) {
+        *serial_ms = t_serial;
+    }
+    return t_pipe;
+}
+
 //
 // Model utils
 //
@@ -1787,6 +1974,15 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
                     llama_free_model(model);
                     return iparams;
                 }
+
+                if (!params.prompt.empty()) {
+                    const int n_prompt = llama_tokenize(model, params.prompt, true, true).size();
+                    float serial_ms = 0.0f;
+                    const float prefill_ms = predict_prefill_ms(n_world, dev_info_set.data(), n_layer_window, n_gpu_layers, model, cparams, n_prompt, &serial_ms);
+                    LOG_INF("Prefill prediction: n_prompt = %d, n_batch = %u, n_ubatch = %u, prefill_pred_ms = %.1f (old serial schedule: %.1f ms)\n",
+                            n_prompt, cparams.n_batch, cparams.n_ubatch, prefill_ms, serial_ms);
+                }
+
                 llama_bcast_layer_setup(lctx, n_layer_window, n_gpu_layers);
                 llama_rebuild_topo     (lctx, n_layer_window, dev_info_set.data(), &node_type, is_forwarder);
             } else {
