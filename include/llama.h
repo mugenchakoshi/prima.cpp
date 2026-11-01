@@ -440,6 +440,7 @@ extern "C" {
                                       int   cuda_mem,
                                       int   n_predict,
                                       int   n_ctx,
+                                      int   n_ubatch,
                                       int   n_threads,
                                      bool   flash_attn);
 

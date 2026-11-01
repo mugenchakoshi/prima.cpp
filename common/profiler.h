@@ -326,6 +326,26 @@ struct disk_props {
         write_rnd_bw(0.0f) {}
 };
 
+// prefill-shaped benchmarks, used to predict the prompt processing time. 0 means not measured
+struct prefill_props {
+    float cpu_mm_eff;  // matmul FLOPS at a layer's shape (n_embd x n_ff, n_ubatch tokens) / the square matmul benchmark
+    float cpu_attn_ns; // ns per attention score (one head, one query, one KV cell) through KQ, softmax and KQV
+    float cpu_op_us;   // fixed cost of one graph node in us
+    float gpu_mm_eff;
+    float gpu_attn_ns;
+    float gpu_op_us;
+    float gpu_h2d_bw;  // host to GPU copy bandwidth in GB/s, for CPU-resident weights the GPU computes in prefill
+
+    prefill_props() :
+        cpu_mm_eff (0.0f),
+        cpu_attn_ns(0.0f),
+        cpu_op_us  (0.0f),
+        gpu_mm_eff (0.0f),
+        gpu_attn_ns(0.0f),
+        gpu_op_us  (0.0f),
+        gpu_h2d_bw (0.0f) {}
+};
+
 struct startup_args{
     bool     should_profile;
     uint32_t n_ctx;
@@ -341,20 +361,22 @@ struct device_info {
     struct memory_info  memory;
     struct gpu_support  gpu_support;
     struct gpu_props    gpu_props;
+    struct prefill_props prefill;
     struct model_flops  model_flops;
     struct model_params model_params;
     struct model_bytes  model_bytes;
 
-    device_info() : 
-        rank(0), 
-        device_name(""), 
+    device_info() :
+        rank(0),
+        device_name(""),
         device_os(""),
         next_ip(""),
         disk(),
-        cpu_props(), 
-        memory(), 
-        gpu_support(), 
-        gpu_props(), 
+        cpu_props(),
+        memory(),
+        gpu_support(),
+        gpu_props(),
+        prefill(),
         model_flops(),
         model_params(),
         model_bytes() {}
@@ -403,6 +425,7 @@ float    device_metal_mem_copy    (struct llama_model * model);
 float    device_cuda_mem_copy     (struct llama_model * model);
 float    device_metal_read_vram_bw();
 float    device_cuda_read_vram_bw ();
+void     device_prefill_props     (struct llama_model * model, struct prefill_props * props, int n_ubatch, int n_threads);
 void     device_get_props         (struct llama_model * model, int device, struct ggml_backend_dev_props * props); 
 void     device_print_props       (struct device_info * dev_info_set, int n, struct llama_model * model, const struct llama_context_params cparams);
 

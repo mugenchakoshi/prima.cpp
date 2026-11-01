@@ -1709,9 +1709,16 @@ static float device_token_compute_ms(const device_info & dev, const model_flops 
 // before its next one. Each stage starts a ubatch once its device is free and the previous stage has
 // finished that ubatch. Otherwise each ubatch goes around the whole ring alone (serial_ms is this old
 // schedule for every chunk, for comparison).
-// Prefill is compute-bound, so the per-token layer FLOPs are scaled by the ubatch size, plus attention
-// over the KV cells filled so far and one weight read per ubatch. Layers that do not fit in RAM are read
-// from disk once per window pass. Communication is ignored, there is no network profiling yet
+// A layer on a ubatch of n tokens with kv KV cells filled costs:
+//   - the matmuls: n x the per-token layer FLOPs over the square-matmul FLOPS times the matmul efficiency
+//     measured at a layer's shape (prefill_props.mm_eff, which also covers reading the weights)
+//   - attention: n_head x kv x n scores times the measured cost per score (KQ, softmax and KQV)
+//   - the element-wise ops (norms, rope, residual adds, SiLU, KV copies): their activation traffic over
+//     the memory bandwidth, plus a fixed cost per graph node
+// On a device with a GPU, the CPU layers of a ubatch of 32+ tokens also run on the GPU and upload their
+// weights over PCIe every ubatch. Without prefill_props (0), the matmuls fall back to the square FLOPS plus one weight read per ubatch
+// and attention to its FLOPs over the f16 FLOPS. Layers that do not fit in RAM are read from disk once
+// per window pass. Communication is ignored, there is no network profiling yet
 static float predict_prefill_ms(
                                 uint32_t   n_world,
                        const device_info * dev_info_set,
@@ -1726,6 +1733,13 @@ static float predict_prefill_ms(
     const int64_t       bo      = dev_info_set[0].model_bytes.nb_output;
     const uint32_t      n_layer = llama_model_n_layers(model);
     const int64_t       n_embd  = llama_n_embd(model);
+    const int64_t       n_head  = llama_n_head(model);
+    const int64_t       n_ff    = llama_n_ff_hidden(model);
+
+    // per token and layer, in f32: 2 norms, 2 norm-weight muls and 2 residual adds over n_embd, rope on Q
+    // and K, the KV copies, the merged KQV copy, SiLU and gate*up over n_ff, each read and written
+    const double elem_bytes  = 4.0 * (20 * n_embd + 4 * llama_model_n_embd_k_gqa(model) + 5 * n_ff);
+    const int    layer_nodes = 23; // compute nodes per layer in the llama graph
 
     // devices in ring order: the layers start at rank 1 and rank 0 holds the last window of each cycle
     std::vector<uint32_t> ring;
@@ -1749,16 +1763,36 @@ static float predict_prefill_ms(
         const bool has_gpu  = dev.gpu_support.cuda || dev.gpu_support.metal;
         const int  n_gpu    = has_gpu ? std::min(n_gpu_layers[m], n_layer_window[m]) : 0;
         const int  n_cpu    = n_layer_window[m] - n_gpu;
-        const double attn   = 4.0 * n_embd * kv * n; // KQ and KQV
-        double ms = n_cpu * (n * device_token_compute_ms(dev, mf, false, false)
-                             + attn / (dev.cpu_props.flops_f16_f32 * 1e9 + EPS) * 1000
-                             + b / (dev.memory.cpu_read_ram_bw * 1e9 + EPS) * 1000);
-        if (n_gpu > 0) {
-            const float gpu_f16 = dev.gpu_support.metal ? dev.gpu_props.metal_flops_f16_f32 : dev.gpu_props.cuda_flops_f16_f32;
-            const float gpu_bw  = dev.gpu_support.metal ? dev.gpu_props.metal_read_vram_bw  : dev.gpu_props.cuda_read_vram_bw;
-            ms += n_gpu * (n * device_token_compute_ms(dev, mf, true, false)
-                           + attn / (gpu_f16 * 1e9 + EPS) * 1000
-                           + b / (gpu_bw * 1e9 + EPS) * 1000);
+
+        auto layer_ms = [&](bool gpu, float f16_flops, float bw, float mm_eff, float attn_ns, float op_us) {
+            double ms;
+            if (mm_eff > 0.0f) {
+                ms = n * device_token_compute_ms(dev, mf, gpu, false) / mm_eff;
+            } else {
+                ms = n * device_token_compute_ms(dev, mf, gpu, false) + b / (bw * 1e9 + EPS) * 1000;
+            }
+            if (attn_ns > 0.0f) {
+                ms += (double)n_head * kv * n * attn_ns * 1e-6;
+            } else {
+                ms += 4.0 * n_embd * kv * n / (f16_flops * 1e9 + EPS) * 1000; // KQ and KQV FLOPs
+            }
+            ms += n * elem_bytes / (bw * 1e9 + EPS) * 1000 + layer_nodes * op_us * 1e-3;
+            return ms;
+        };
+
+        const prefill_props & pp = dev.prefill;
+        const bool   metal  = dev.gpu_support.metal;
+        const double gpu_ms = !has_gpu ? 0.0 : layer_ms(true, metal ? dev.gpu_props.metal_flops_f16_f32 : dev.gpu_props.cuda_flops_f16_f32,
+                                                        metal ? dev.gpu_props.metal_read_vram_bw : dev.gpu_props.cuda_read_vram_bw,
+                                                        pp.gpu_mm_eff, pp.gpu_attn_ns, pp.gpu_op_us);
+        double ms = n_gpu * gpu_ms;
+        if (has_gpu && n >= 32 && pp.gpu_h2d_bw > 0.0f) {
+            // ggml-cuda computes ops of 32+ tokens on the GPU even when the weights stay in RAM (offload_op),
+            // so the CPU layers run at GPU speed but upload their weights for every ubatch
+            ms += n_cpu * (gpu_ms + b / (pp.gpu_h2d_bw * 1e9) * 1000);
+        } else {
+            ms += n_cpu * layer_ms(false, dev.cpu_props.flops_f16_f32, dev.memory.cpu_read_ram_bw,
+                                   pp.cpu_mm_eff, pp.cpu_attn_ns, pp.cpu_op_us);
         }
         return ms;
     };
@@ -1952,7 +1986,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
             dev_info.rank = params.rank;
             dev_info.next_ip = params.next_node_ip.c_str();
             if (n_world > 1) {
-                llama_profile_device(&dev_info, model, ml, params.gpu_mem, params.n_predict, params.n_ctx, params.cpuparams.n_threads, params.flash_attn);
+                llama_profile_device(&dev_info, model, ml, params.gpu_mem, params.n_predict, params.n_ctx, params.n_ubatch, params.cpuparams.n_threads, params.flash_attn);
             }
         }
 
@@ -1981,6 +2015,11 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
                     const float prefill_ms = predict_prefill_ms(n_world, dev_info_set.data(), n_layer_window, n_gpu_layers, model, cparams, n_prompt, &serial_ms);
                     LOG_INF("Prefill prediction: n_prompt = %d, n_batch = %u, n_ubatch = %u, prefill_pred_ms = %.1f (old serial schedule: %.1f ms)\n",
                             n_prompt, cparams.n_batch, cparams.n_ubatch, prefill_ms, serial_ms);
+                    for (uint32_t m = 0; m < n_world; ++m) {
+                        const prefill_props & pp = dev_info_set[m].prefill;
+                        LOG_INF("  prefill props of rank %u: CPU mm_eff %.2f attn %.4f ns op %.1f us | GPU mm_eff %.2f attn %.4f ns op %.1f us h2d %.1f GB/s\n",
+                                m, pp.cpu_mm_eff, pp.cpu_attn_ns, pp.cpu_op_us, pp.gpu_mm_eff, pp.gpu_attn_ns, pp.gpu_op_us, pp.gpu_h2d_bw);
+                    }
                 }
 
                 llama_bcast_layer_setup(lctx, n_layer_window, n_gpu_layers);

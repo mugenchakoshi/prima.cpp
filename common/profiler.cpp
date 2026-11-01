@@ -45,6 +45,7 @@
 #include <random>
 #include <regex>
 #include <unordered_map>
+#include <functional>
 #include <dirent.h>
 
 
@@ -329,6 +330,174 @@ float device_cuda_flops(struct llama_model * model, enum ggml_type src0t, enum g
     (void)src0t;
     (void)src1t;
     return flops;
+}
+
+// time in us of one run of the graph that build() makes, the best of 3 after a warm-up run. build() creates
+// the input tensors in ctx_inp (zero-filled before running) and the ops in ctx_ops, and returns the output
+static double profile_graph_us(enum profiler_backend_type btype, int n_threads,
+        const std::function<struct ggml_tensor * (struct ggml_context *, struct ggml_context *)> & build) {
+    ggml_backend_t backend = NULL;
+    switch (btype) {
+        case PROFILER_BACKEND_TYPE_CPU:
+            backend = ggml_backend_cpu_init();
+            break;
+        case PROFILER_BACKEND_TYPE_METAL:
+#ifdef GGML_USE_METAL
+            backend = ggml_backend_metal_init();
+#endif
+            break;
+        case PROFILER_BACKEND_TYPE_CUDA:
+#ifdef GGML_USE_CUDA
+            backend = ggml_backend_cuda_init(0);
+#endif
+            break;
+    }
+    if (!backend) {
+        return 0.0;
+    }
+    if (ggml_backend_is_cpu(backend)) {
+        ggml_backend_cpu_set_n_threads(backend, n_threads);
+    }
+
+    const size_t max_nodes = 1024;
+    struct ggml_init_params params_inp = { ggml_tensor_overhead() * 8, NULL, true };
+    struct ggml_init_params params_ops = { ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false), NULL, true };
+    struct ggml_context * ctx_inp = ggml_init(params_inp);
+    struct ggml_context * ctx_ops = ggml_init(params_ops);
+
+    struct ggml_tensor  * out = build(ctx_inp, ctx_ops);
+    struct ggml_cgraph  * gf  = ggml_new_graph_custom(ctx_ops, max_nodes, false);
+    ggml_build_forward_expand(gf, out);
+
+    double best_us = 0.0;
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx_inp, backend);
+    ggml_gallocr_t        allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (buffer && ggml_gallocr_alloc_graph(allocr, gf)) {
+        ggml_backend_buffer_clear(buffer, 0);
+        ggml_backend_graph_compute(backend, gf); // warm-up
+        for (int i = 0; i < 3; ++i) {
+            const int64_t t_start = ggml_time_us();
+            ggml_backend_graph_compute(backend, gf);
+            const double us = ggml_time_us() - t_start;
+            best_us = i == 0 ? us : std::min(best_us, us);
+        }
+    }
+
+    ggml_gallocr_free(allocr);
+    if (buffer) {
+        ggml_backend_buffer_free(buffer);
+    }
+    ggml_free(ctx_ops);
+    ggml_free(ctx_inp);
+    ggml_backend_free(backend);
+    return best_us;
+}
+
+// prefill-shaped benchmarks on one backend: matmul efficiency at a layer's shape, attention cost per score
+// and fixed cost per graph node. The CPU runs smaller shapes to keep profiling short
+static void device_prefill_props_backend(struct llama_model * model, enum profiler_backend_type btype, int n_ubatch,
+                                         int n_threads, float * mm_eff, float * attn_ns, float * op_us) {
+    const bool cpu        = btype == PROFILER_BACKEND_TYPE_CPU;
+    const int  n_embd     = llama_n_embd(model);
+    const int  n_head     = llama_n_head(model);
+    const int  head_dim   = n_embd / n_head;
+    const int  n_head_kv  = llama_model_n_embd_k_gqa(model) / head_dim;
+
+    // Q4_K weights of n_embd x n_ff (the FFN matmuls dominate a layer) times n_ubatch tokens, compared with
+    // the square benchmark that device_flops runs
+    {
+        const int K = cpu ? std::min(n_embd, 2048) : n_embd;
+        const int M = cpu ? std::min(llama_n_ff_hidden(model), 4096) : llama_n_ff_hidden(model);
+        const int N = cpu ? std::min(n_ubatch, 64) : n_ubatch;
+        const double us = profile_graph_us(btype, n_threads, [&](ggml_context * ctx_inp, ggml_context * ctx_ops) {
+            struct ggml_tensor * w = ggml_new_tensor_2d(ctx_inp, GGML_TYPE_Q4_K, K, M);
+            struct ggml_tensor * x = ggml_new_tensor_2d(ctx_inp, GGML_TYPE_F32,  K, N);
+            return ggml_mul_mat(ctx_ops, w, x);
+        });
+        const float square = device_flops(model, GGML_TYPE_Q4_K, GGML_TYPE_F32, btype, n_threads);
+        *mm_eff = us > 0.0 && square > 0.0f ? (float)(2.0 * K * M * N / us / 1e3 / square) : 0.0f;
+    }
+
+    // KQ, masked softmax and KQV of the non-flash-attention path over n_kv cached tokens
+    {
+        const int n_kv = cpu ? 256 : 2048;
+        const int N    = cpu ? std::min(n_ubatch, 32) : n_ubatch;
+        const double us = profile_graph_us(btype, n_threads, [&](ggml_context * ctx_inp, ggml_context * ctx_ops) {
+            struct ggml_tensor * q    = ggml_new_tensor_3d(ctx_inp, GGML_TYPE_F32, head_dim, N, n_head);
+            struct ggml_tensor * k    = ggml_new_tensor_3d(ctx_inp, GGML_TYPE_F16, head_dim, n_kv, n_head_kv);
+            struct ggml_tensor * v    = ggml_new_tensor_3d(ctx_inp, GGML_TYPE_F16, n_kv, head_dim, n_head_kv);
+            struct ggml_tensor * mask = ggml_new_tensor_2d(ctx_inp, GGML_TYPE_F32, n_kv, GGML_PAD(N, GGML_KQ_MASK_PAD));
+            struct ggml_tensor * kq   = ggml_mul_mat(ctx_ops, k, q);
+            kq = ggml_soft_max_ext(ctx_ops, kq, mask, 1.0f / sqrtf((float)head_dim), 0.0f);
+            return ggml_mul_mat(ctx_ops, v, kq);
+        });
+        *attn_ns = us > 0.0 ? (float)(us * 1e3 / ((double)n_head * n_kv * N)) : 0.0f;
+    }
+
+    // a chain of tiny adds, so the time is the per-node launch and synchronization cost
+    {
+        const int n_nodes = 256;
+        const double us = profile_graph_us(btype, n_threads, [&](ggml_context * ctx_inp, ggml_context * ctx_ops) {
+            struct ggml_tensor * a   = ggml_new_tensor_1d(ctx_inp, GGML_TYPE_F32, 64);
+            struct ggml_tensor * b   = ggml_new_tensor_1d(ctx_inp, GGML_TYPE_F32, 64);
+            struct ggml_tensor * cur = a;
+            for (int i = 0; i < n_nodes; ++i) {
+                cur = ggml_add(ctx_ops, cur, b);
+            }
+            return cur;
+        });
+        *op_us = (float)(us / n_nodes);
+    }
+}
+
+// host to GPU copy bandwidth in GB/s from pageable memory, like mmap'd model weights
+static float device_gpu_h2d_bw(enum profiler_backend_type btype) {
+    ggml_backend_t backend = NULL;
+#ifdef GGML_USE_CUDA
+    if (btype == PROFILER_BACKEND_TYPE_CUDA) {
+        backend = ggml_backend_cuda_init(0);
+    }
+#endif
+    (void)btype;
+    if (!backend) {
+        return 0.0f;
+    }
+
+    const size_t n_elem = 64 * 1024 * 1024; // 256 MiB
+    std::vector<float> host(n_elem, 1.0f);
+    struct ggml_init_params params = { ggml_tensor_overhead(), NULL, true };
+    struct ggml_context * ctx = ggml_init(params);
+    struct ggml_tensor  * t   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_elem);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    double best_us = 0.0;
+    if (buffer) {
+        ggml_backend_tensor_set(t, host.data(), 0, ggml_nbytes(t)); // warm-up
+        for (int i = 0; i < 3; ++i) {
+            const int64_t t_start = ggml_time_us();
+            ggml_backend_tensor_set(t, host.data(), 0, ggml_nbytes(t));
+            ggml_backend_synchronize(backend);
+            const double us = ggml_time_us() - t_start;
+            best_us = i == 0 ? us : std::min(best_us, us);
+        }
+        ggml_backend_buffer_free(buffer);
+    }
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return best_us > 0.0 ? (float)(n_elem * sizeof(float) / best_us / 1e3) : 0.0f;
+}
+
+void device_prefill_props(struct llama_model * model, struct prefill_props * props, int n_ubatch, int n_threads) {
+    device_prefill_props_backend(model, PROFILER_BACKEND_TYPE_CPU, n_ubatch, n_threads,
+                                 &props->cpu_mm_eff, &props->cpu_attn_ns, &props->cpu_op_us);
+#if defined(GGML_USE_CUDA)
+    device_prefill_props_backend(model, PROFILER_BACKEND_TYPE_CUDA, n_ubatch, n_threads,
+                                 &props->gpu_mm_eff, &props->gpu_attn_ns, &props->gpu_op_us);
+    props->gpu_h2d_bw = device_gpu_h2d_bw(PROFILER_BACKEND_TYPE_CUDA);
+#elif defined(GGML_USE_METAL)
+    device_prefill_props_backend(model, PROFILER_BACKEND_TYPE_METAL, n_ubatch, n_threads,
+                                 &props->gpu_mm_eff, &props->gpu_attn_ns, &props->gpu_op_us);
+#endif
 }
 
 float device_inp_embd_delay(struct llama_model * model, enum ggml_type src0t, int n_tokens, int n_threads) {
@@ -2419,7 +2588,7 @@ size_t serialize(const struct device_info * dev_info, char ** buffer) {
                                             // - cpu_props.flops_iq1m_f32
                       + sizeof(struct memory_info)
                       + sizeof(struct gpu_support)
-                      + sizeof(float) * 30;     // GPU attributes
+                      + sizeof(float) * 30      // GPU attributes
                                                 // memory:
                                                 // - memory_free,           memory_total
                                                 // - metal_read_vram_bw,    cuda_read_vram_bw
@@ -2439,6 +2608,7 @@ size_t serialize(const struct device_info * dev_info, char ** buffer) {
                                                 // - cuda_flops_iq1m_f32
                                                 // delay:
                                                 // - metal_mem_cpy_delay,   cuda_mem_cpy_delay
+                      + sizeof(struct prefill_props);
 
     *buffer = (char *)malloc(total_size);
     char * ptr = *buffer;
@@ -2626,6 +2796,9 @@ size_t serialize(const struct device_info * dev_info, char ** buffer) {
     ptr += sizeof(float);
 
     memcpy(ptr, &dev_info->gpu_props.cuda_mem_cpy_delay, sizeof(float));
+    ptr += sizeof(float);
+
+    memcpy(ptr, &dev_info->prefill, sizeof(struct prefill_props));
 
     // no need to synchronize model flops and model params
     return total_size;
@@ -2832,6 +3005,9 @@ size_t deserialize(const char * buffer, struct device_info * dev_info) {
 
     memcpy(&dev_info->gpu_props.cuda_mem_cpy_delay, ptr, sizeof(float));
     ptr += sizeof(float);
+
+    memcpy(&dev_info->prefill, ptr, sizeof(struct prefill_props));
+    ptr += sizeof(struct prefill_props);
 
     // no need to synchronize model flops and model params
     return ptr - buffer;

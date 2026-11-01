@@ -3625,6 +3625,7 @@ void llama_profile_device(
                         int   gpu_mem,
                         int   n_predict,
                         int   n_ctx, 
+                        int   n_ubatch,
                         int   n_threads,
                        bool   flash_attn) {
     dev_info->device_name               = device_name();
@@ -3756,6 +3757,8 @@ void llama_profile_device(
         dev_info->gpu_props.metal_flops_iq1m_f32  = device_metal_flops(model, GGML_TYPE_IQ1_M, GGML_TYPE_F32);
         dev_info->gpu_props.cuda_flops_iq1m_f32   = device_cuda_flops (model, GGML_TYPE_IQ1_M, GGML_TYPE_F32);
     }
+
+    device_prefill_props(model, &dev_info->prefill, n_ubatch, n_threads);
 }
 
 ggml_backend_buffer_type_t llama_dev_buffer_type(struct llama_model * model, int device) {
