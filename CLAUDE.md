@@ -78,8 +78,15 @@ When `PRIMA_PROFILE=<csv path>` is set, `src/llama.cpp` uses the scheduler's eva
 Check these before you treat a Halda prediction as meaningful:
 
 - Several memory-read terms (`t_read_ram_*`) are commented out upstream. The `halda-mem-read` branch re-enables them.
-- `xi` (the communication term) is fixed at 0.
 - `kappa` uses layer FLOPs rather than the output-layer FLOPs.
-- KV size uses `n_ctx`, not the KV length actually in use.
-- Halda models only decode (TPOT). It does not model prefill.
-- When the problem is infeasible on the first iteration, Halda hits a `GGML_ASSERT` instead of falling back.
+- `xi` stays 0 inside the LP. `--halda-e2e` adds the measured network latency and `--cycle-cost-ms` (a per-device-switch decode cost, not profiled) only when it compares cycle counts.
+- On this branch, the decode memory-read term uses the KV length in use (prompt + half of `n_predict`). Capacity and disk terms still use `n_ctx`, which is what gets allocated. Attention FLOPs (`llama_model_n_flops`) still ignore the prompt length.
+- The Halda LP models only decode (TPOT). On this branch, `predict_prefill_ms` (common.cpp) predicts prefill separately. It covers the pipelined schedule, the network, prompt-cache hits and page-cache misses. `--halda-e2e` picks k by TTFT + n_predict × TPOT.
+- When the problem is infeasible, Halda now returns false instead of asserting (this branch).
+
+## Prefill prediction (this branch)
+
+- Inputs: `device_info.prefill` (matmul efficiency, attention ns per score, per-node cost, H2D bandwidth, and the page-cache fraction per layer), plus `llama_profile_network`. `llama_profile_network` runs a ring probe at startup; only rank 0 keeps the result.
+- `llama_predict_prefill_ms(n_prompt, n_cached, first)` (common.h) works after startup on rank 0. llama-server returns it as `timings.prompt_pred_ms`.
+- The warmup decode reads every weight, so page-cache misses cost startup time, not TTFT, unless you pass `--no-warmup`. Rank 0 now broadcasts `--no-warmup`, and all ranks skip the warmup together.
+- `device_info` changes alter the wire format. The Makefile does not track `profiler.h`, so after you change it, `touch src/llama.cpp common/*.cpp` on every machine.

@@ -865,6 +865,7 @@ static bool assign_layers_to_device(
                       struct llama_model * model,
        const struct llama_context_params   cparams,
                                      int   n_prompt,
+                                   float * tpot_ms,                     // out: the objective (decode ms per token), if not null
                                    float   min_disk_read_speed = 0.1f) { // minimum disk I/O speed: 100 MB/s
     GGML_ASSERT(dev_info_set != nullptr);
     GGML_ASSERT(n_layer_window != nullptr);
@@ -1135,6 +1136,7 @@ static bool assign_layers_to_device(
 
     std::vector<double> final_solution, rollback_solution;
     int final_k = -1, rollback_k = -1;
+    double final_obj = -1.0, rollback_obj = -1.0;
 
     // iterative optimization to find a valid set assignment (M1, M2, M3, M4)
     while (true) {
@@ -1438,9 +1440,15 @@ static bool assign_layers_to_device(
 
         if (best_solution.empty()) {
             LOG_INF("No feasible solution found for this set assignment, rolling back to previous sets.\n");
+            if (rollback_solution.empty()) {
+                // infeasible from the first set assignment on, e.g. with a forced number of cycles
+                LOG_INF("No feasible solution at all\n");
+                return false;
+            }
 
             final_solution = rollback_solution;
             final_k = rollback_k;
+            final_obj = rollback_obj;
 
             // update w[m] and n[m]
             GGML_ASSERT(final_solution.size() == n_world * 2 && "Invalid solution\n");
@@ -1451,6 +1459,7 @@ static bool assign_layers_to_device(
         } else {
             rollback_solution = best_solution;
             rollback_k = best_k;
+            rollback_obj = best_objective;
         }
 
         // check the solution
@@ -1516,8 +1525,15 @@ static bool assign_layers_to_device(
         // update the global best solution
         final_k = best_k;
         final_solution = best_solution;
+        final_obj = best_objective;
 
         if (solution_unchanged) break;
+    }
+
+    if (final_solution.size() != n_world * 2) {
+        // the loop ended without accepting a solution (e.g. infeasible and no device could be forced into M4)
+        LOG_INF("No valid solution found\n");
+        return false;
     }
 
     LOG_INF("\n----- Allocation Strategy (by HiGHS) -----\n");
@@ -1538,10 +1554,16 @@ static bool assign_layers_to_device(
     // copy value from w and n to n_layer_window and n_gpu_layers, respectively
     std::copy(w.begin(), w.end(), n_layer_window);
     std::copy(n.begin(), n.end(), n_gpu_layers);
+    if (tpot_ms) {
+        *tpot_ms = final_obj;
+    }
 
 #else
     (void)min_disk_read_speed;
     (void)n_prompt;
+    if (tpot_ms) {
+        *tpot_ms = -1.0f;
+    }
 
     // assign layers according to RAM/VRAM
     for (uint32_t m = 0; m < n_world; ++m) {
@@ -1611,7 +1633,8 @@ static bool assign_layers_and_select_devices(
                                 uint32_t * n_gpu_layers,
                       struct llama_model * model,
        const struct llama_context_params   cparams,
-                                     int   n_prompt) {
+                                     int   n_prompt,
+                                   float * tpot_ms = nullptr) {
     memset(n_layer_window, 0, n_world * sizeof(uint32_t));
     memset(n_gpu_layers,   0, n_world * sizeof(uint32_t));
 
@@ -1623,7 +1646,7 @@ static bool assign_layers_and_select_devices(
         std::vector<uint32_t> n_layer_windows_(n_world, 0), n_gpu_layers_(n_world, 0);
         
         if (!assign_layers_to_device(n_world, dev_infos_.data(), 
-                                     n_layer_windows_.data(), n_gpu_layers_.data(), model, cparams, n_prompt)) {
+                                     n_layer_windows_.data(), n_gpu_layers_.data(), model, cparams, n_prompt, tpot_ms)) {
             return false;
         }
 
@@ -1724,7 +1747,7 @@ static float device_token_compute_ms(const device_info & dev, const model_flops 
 // schedule for every chunk, for comparison).
 // A layer on a ubatch of n tokens with kv KV cells filled costs:
 //   - the matmuls: n x the per-token layer FLOPs over the square-matmul FLOPS times the matmul efficiency
-//     measured at a layer's shape (prefill_props.mm_eff, which also covers reading the weights)
+//     measured at a layer's shape (prefill_props.mm_eff), but at least one read of the weights (few tokens)
 //   - attention: n_head x kv x n scores times the measured cost per score (KQ, softmax and KQV)
 //   - the element-wise ops (norms, rope, residual adds, SiLU, KV copies): their activation traffic over
 //     the memory bandwidth, plus a fixed cost per graph node
@@ -1737,7 +1760,12 @@ static float device_token_compute_ms(const device_info & dev, const model_flops 
 // Both are charged to the devices. The transfer itself goes over the hops of the ring (through forwarders
 // too) with the latency and bandwidth measured by llama_profile_network (hop_lat_ms / hop_bw, indexed by
 // the sending rank, nullptr to ignore the network), and the link of a device carries one ubatch at a time
-// while the devices keep computing
+// while the devices keep computing.
+// The first n_cached tokens of the prompt already have their KV cells (a prompt cache hit), so only the rest
+// is computed, from position n_cached on, attending to the cached cells too. At least the last token is
+// always computed, for its logits. When first is set, this is the first prompt since startup: the mmap-ed
+// weights a device computes from RAM (its CPU layers, and rank 0's output layer unless it is on CUDA) that
+// were not in the page cache at startup (prefill_props.cached_*) are read from disk in the first window pass
 static float predict_prefill_ms(
                                 uint32_t   n_world,
                        const device_info * dev_info_set,
@@ -1746,6 +1774,8 @@ static float predict_prefill_ms(
                       struct llama_model * model,
        const struct llama_context_params & cparams,
                                      int   n_prompt,
+                                     int   n_cached,
+                                    bool   first,
                              const float * hop_lat_ms,
                              const float * hop_bw,
                                    float * serial_ms) {
@@ -1788,7 +1818,9 @@ static float predict_prefill_ms(
         auto layer_ms = [&](bool gpu, float f16_flops, float bw, float mm_eff, float attn_ns, float op_us) {
             double ms;
             if (mm_eff > 0.0f) {
-                ms = n * device_token_compute_ms(dev, mf, gpu, false) / mm_eff;
+                // mm_eff is measured at n_ubatch tokens, where the matmuls are compute bound. With few tokens
+                // (a cache hit leaves one) they are bound by reading the weights instead
+                ms = std::max<double>(n * device_token_compute_ms(dev, mf, gpu, false) / mm_eff, b / (bw * 1e9 + EPS) * 1000);
             } else {
                 ms = n * device_token_compute_ms(dev, mf, gpu, false) + b / (bw * 1e9 + EPS) * 1000;
             }
@@ -1831,8 +1863,9 @@ static float predict_prefill_ms(
 
     // the output layer runs for the last token of the prompt only
     const device_info & master = dev_info_set[0];
+    const bool out_on_gpu = cparams.keep_out_in_cuda && master.gpu_support.cuda;
     double out_ms;
-    if (cparams.keep_out_in_cuda && master.gpu_support.cuda) {
+    if (out_on_gpu) {
         out_ms = device_token_compute_ms(master, mf, true, true) + bo / (master.gpu_props.cuda_read_vram_bw * 1e9 + EPS) * 1000;
     } else {
         out_ms = device_token_compute_ms(master, mf, false, true) + bo / (master.memory.cpu_read_ram_bw * 1e9 + EPS) * 1000;
@@ -1896,9 +1929,42 @@ static float predict_prefill_ms(
     };
     auto stage_disk_ms = [&](size_t i) { return i == 0 || n_layer_window[seq[i]] == 0 ? 0.0 : disk_ms[seq[i]]; };
 
+    // disk reads of the first prompt since startup, per stage: the CPU layers of the window (the first
+    // w - n_gpu layers of it, see llm_load_tensors) not in the page cache, beyond what disk_ms reads anyway
+    std::vector<double> cold_ms(seq.size(), 0.0);
+    double out_cold_ms = 0.0;
+    if (first) {
+        uint32_t layer = 0;
+        for (size_t i = 1; i < seq.size(); ++i) {
+            const uint32_t m = seq[i];
+            const uint32_t w = n_layer_window[m];
+            if (w == 0) {
+                continue;
+            }
+            const device_info & dev = dev_info_set[m];
+            const bool     has_gpu = dev.gpu_support.cuda || dev.gpu_support.metal;
+            const uint32_t n_cpu   = w - (has_gpu ? std::min(n_gpu_layers[m], w) : 0);
+            const float    disk_bw = strcmp(dev.device_os, "Linux") == 0 ? dev.disk.read_seq_bw : dev.disk.read_rnd_bw;
+            double uncached = 0.0;
+            for (uint32_t l = layer; l < layer + n_cpu && l < PREFILL_MAX_LAYERS; ++l) {
+                uncached += (1.0 - dev.prefill.cached_layer[l]) * b;
+            }
+            const double spilled = disk_ms[m] / 1000 * disk_bw * 1e9;
+            cold_ms[i] = std::max(0.0, uncached - spilled) / (disk_bw * 1e9 + EPS) * 1000;
+            layer += w;
+        }
+        if (!out_on_gpu) {
+            const float disk_bw = strcmp(master.device_os, "Linux") == 0 ? master.disk.read_seq_bw : master.disk.read_rnd_bw;
+            out_cold_ms = (1.0 - master.prefill.cached_output) * bo / (disk_bw * 1e9 + EPS) * 1000;
+        }
+    }
+
+    n_cached = std::max(0, std::min(n_cached, n_prompt - 1));
+
     double t_pipe = 0.0, t_serial = 0.0;
-    for (int pos = 0; pos < n_prompt; pos += cparams.n_batch) {
-        const int n_chunk = std::min<int>(cparams.n_batch, n_prompt - pos);
+    for (int pos = n_cached; pos < n_prompt; pos += cparams.n_batch) {
+        const int  n_chunk = std::min<int>(cparams.n_batch, n_prompt - pos);
+        const bool cold    = pos == n_cached; // the first chunk reads the uncached weights
 
         std::vector<int> ub_n, ub_kv;
         for (int i = 0; i < n_chunk; i += cparams.n_ubatch) {
@@ -1914,10 +1980,10 @@ static float predict_prefill_ms(
                 if (i > 0) {
                     t_chunk_serial += hop_ms(seq[i - 1], seq[i], ub_n[u]);
                 }
-                t_chunk_serial += stage_disk_ms(i) + stage_ms(i, ub_n[u], ub_kv[u]);
+                t_chunk_serial += stage_disk_ms(i) + (cold && u == 0 ? cold_ms[i] : 0.0) + stage_ms(i, ub_n[u], ub_kv[u]);
             }
         }
-        t_chunk_serial += out_ms;
+        t_chunk_serial += out_ms + (cold ? out_cold_ms : 0.0);
         t_serial += t_chunk_serial;
 
         if (!tiled || n_ub == 1) {
@@ -1937,19 +2003,129 @@ static float predict_prefill_ms(
                     ready[u] = link_free[a];
                 }
             }
-            dev_free[m] += stage_disk_ms(i);
+            dev_free[m] += stage_disk_ms(i) + (cold ? cold_ms[i] : 0.0);
             for (size_t u = 0; u < n_ub; ++u) {
                 dev_free[m] = std::max(dev_free[m], ready[u]) + stage_ms(i, ub_n[u], ub_kv[u]);
                 ready[u] = dev_free[m];
             }
         }
-        t_pipe = ready[n_ub - 1] + out_ms;
+        t_pipe = ready[n_ub - 1] + out_ms + (cold ? out_cold_ms : 0.0);
     }
 
     if (serial_ms) {
         *serial_ms = t_serial;
     }
     return t_pipe;
+}
+
+// what predict_prefill_ms needs, kept from startup on rank 0 so that later prompts can be predicted
+struct prefill_predictor {
+    bool                      valid = false;
+    uint32_t                  n_world = 0;
+    std::vector<device_info>  dev_info_set;
+    std::vector<uint32_t>     n_layer_window;
+    std::vector<uint32_t>     n_gpu_layers;
+    struct llama_model      * model = nullptr;
+    llama_context_params      cparams;
+    std::vector<float>        hop_lat_ms;
+    std::vector<float>        hop_bw;
+    bool                      warmed_up = false; // the warmup decode read every weight at startup
+};
+static prefill_predictor g_prefill_predictor;
+
+float llama_predict_prefill_ms(int n_prompt, int n_cached, bool first) {
+    const prefill_predictor & p = g_prefill_predictor;
+    if (!p.valid || n_prompt <= 0) {
+        return -1.0f;
+    }
+    return predict_prefill_ms(p.n_world, p.dev_info_set.data(), p.n_layer_window.data(), p.n_gpu_layers.data(), p.model, p.cparams,
+                              n_prompt, n_cached, first && !p.warmed_up, p.hop_lat_ms.data(), p.hop_bw.data(), nullptr);
+}
+
+// Halda minimizes the decode time per token (TPOT) only. This picks the number of cycles k by the predicted
+// time of a whole request instead: TTFT + n_gen x TPOT. Halda is solved again with each k forced (each is a
+// TPOT-optimal assignment for that k, the same candidates Halda compares), and the prefill of the expected
+// prompt is predicted for each. The TPOT also gets the per-cycle costs Halda leaves out (xi = 0): a decode
+// token goes k times around the ring hops (measured network latency), and every switch to another device's
+// window costs cycle_cost_ms more (send / receive, copies, graph launch; not profiled yet: on rpc1 + rpc2,
+// 70B, TPOT grows by about 1.1 ms per switch). On return, the arrays and tpot_ms hold the chosen assignment
+static void select_cycles_end_to_end(
+                                uint32_t   n_world,
+                const std::vector<device_info> & dev_info_set,
+                                uint32_t * n_layer_window,
+                                uint32_t * n_gpu_layers,
+                                   float * tpot_ms,
+                      struct llama_model * model,
+       const struct llama_context_params & cparams,
+                                     int   n_prompt,
+                                     int   n_cached,
+                                    bool   first,
+                                     int   n_gen,
+                                   float   cycle_cost_ms,
+                const std::vector<float> & hop_lat_ms,
+                const std::vector<float> & hop_bw) {
+    const uint32_t n_layer = llama_model_n_layers(model);
+    const double   tok_bytes = (double)llama_n_embd(model) * sizeof(float);
+
+    // network time of one decode token for one lap around the ring, through every hop
+    double lap_ms = 0.0;
+    for (uint32_t r = 0; r < n_world; ++r) {
+        lap_ms += hop_lat_ms[r] + (hop_bw[r] > 0.0f ? tok_bytes / (hop_bw[r] * 1e9) * 1000 : 0.0);
+    }
+
+    auto count_cycles = [&](const uint32_t * w) {
+        uint32_t W = 0, n_dev = 0;
+        for (uint32_t m = 0; m < n_world; ++m) {
+            W += w[m];
+            n_dev += w[m] > 0;
+        }
+        return std::make_pair(W > 0 && n_layer % W == 0 ? n_layer / W : 1, n_dev);
+    };
+    auto e2e = [&](const uint32_t * w, const uint32_t * g, float tpot, float * ttft, float * tpot_net) {
+        const auto kd = count_cycles(w); // (k, number of devices with layers)
+        *tpot_net = tpot + (kd.second > 1 ? kd.first * (lap_ms + kd.second * cycle_cost_ms) : 0.0);
+        *ttft     = predict_prefill_ms(n_world, dev_info_set.data(), w, g, model, cparams, n_prompt, n_cached, first,
+                                       hop_lat_ms.data(), hop_bw.data(), nullptr);
+        return *ttft + n_gen * *tpot_net;
+    };
+
+    std::vector<uint32_t> best_w(n_layer_window, n_layer_window + n_world), best_g(n_gpu_layers, n_gpu_layers + n_world);
+    float best_tpot = *tpot_ms, ttft, tpot_net;
+    double best = e2e(best_w.data(), best_g.data(), best_tpot, &ttft, &tpot_net);
+    const uint32_t halda_k = count_cycles(best_w.data()).first;
+    LOG_INF("\nEnd-to-end selection: n_prompt = %d, n_cached = %d, first = %d, n_gen = %d, network lap = %.2f ms, cycle cost = %.2f ms per device switch\n",
+            n_prompt, n_cached, first, n_gen, lap_ms, cycle_cost_ms);
+    LOG_INF("  Halda (TPOT only): k = %2u, TPOT = %.1f (+net %.1f) ms, TTFT = %.1f ms, end-to-end = %.1f ms\n",
+            halda_k, best_tpot, tpot_net, ttft, best);
+
+    for (uint32_t k = 1; k <= n_layer / 2; ++k) {
+        if (n_layer % k != 0 || k == halda_k) {
+            continue;
+        }
+        llama_context_params cparams_k = cparams;
+        cparams_k.n_cycles = k;
+        std::vector<uint32_t> w(n_world, 0), g(n_world, 0);
+        float tpot = -1.0f;
+        if (!assign_layers_and_select_devices(n_world, dev_info_set, w.data(), g.data(), model, cparams_k, n_prompt, &tpot) || tpot < 0.0f) {
+            LOG_INF("  k = %2u: infeasible\n", k);
+            continue;
+        }
+        const double t = e2e(w.data(), g.data(), tpot, &ttft, &tpot_net);
+        LOG_INF("  k = %2u: TPOT = %.1f (+net %.1f) ms, TTFT = %.1f ms, end-to-end = %.1f ms, windows %s\n",
+                count_cycles(w.data()).first, tpot, tpot_net, ttft, t, vec_to_str(w).c_str());
+        if (t < best) {
+            best = t;
+            best_w = w;
+            best_g = g;
+            best_tpot = tpot;
+        }
+    }
+
+    LOG_INF("  chosen: k = %u, windows %s, GPU layers %s, end-to-end = %.1f ms\n\n",
+            count_cycles(best_w.data()).first, vec_to_str(best_w).c_str(), vec_to_str(best_g).c_str(), best);
+    std::copy(best_w.begin(), best_w.end(), n_layer_window);
+    std::copy(best_g.begin(), best_g.end(), n_gpu_layers);
+    *tpot_ms = best_tpot;
 }
 
 //
@@ -2043,6 +2219,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         if (my_rank == 0){
             args.should_profile = auto_schedule;
             args.n_ctx          = params.n_ctx;
+            args.warmup         = params.warmup;
         }
 
         llama_bcast_startup_args(lctx, my_rank, &args);
@@ -2052,6 +2229,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
             auto_schedule = args.should_profile;
             params.n_ctx  = args.n_ctx;
             cparams.n_ctx = args.n_ctx;
+            params.warmup = args.warmup;
         }
 
         // measure every hop of the ring with a ubatch of activations, before the device profiling loads the
@@ -2088,31 +2266,68 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
                 device_print_props      (dev_info_set.data(), n_world, model, cparams);
 
                 // assign layers to devices and remove weak devices. The prompt length sets how much of the
-                // KV cache a decode step reads (0 when the prompt is not known yet, e.g. llama-server)
-                const int n_prompt = params.prompt.empty() ? 0 : (int)llama_tokenize(model, params.prompt, true, true).size();
-                if (!assign_layers_and_select_devices(n_world, dev_info_set, n_layer_window, n_gpu_layers, model, cparams, n_prompt)) {
+                // KV cache a decode step reads; llama-server has no prompt yet, --expected-prompt stands in for it
+                const int n_prompt_given = params.prompt.empty() ? 0 : (int)llama_tokenize(model, params.prompt, true, true).size();
+                const int n_prompt       = n_prompt_given > 0 ? n_prompt_given : params.expected_prompt;
+                float tpot_ms = -1.0f;
+                if (!assign_layers_and_select_devices(n_world, dev_info_set, n_layer_window, n_gpu_layers, model, cparams, n_prompt, &tpot_ms)) {
                     LOG_ERR("%s: Invalid allocation by HiGHS solver\n", __func__);
                     llama_free(lctx);
                     llama_free_model(model);
                     return iparams;
                 }
 
+                // the expected prompt cache hit, and whether the prompt we predict for is the first since startup
+                // and reads the weights that were not in the page cache: llama-cli's prompt is, unless the warmup
+                // decode at startup has already touched every weight
+                const int  n_cached = (int)(params.expected_cache_hit * n_prompt);
+                const bool first    = n_prompt_given > 0 && !params.warmup;
+
+                if (params.halda_e2e && n_prompt > 0 && cparams.n_cycles == 0) { // -k fixes the cycles
+                    select_cycles_end_to_end(n_world, dev_info_set, n_layer_window, n_gpu_layers, &tpot_ms, model, cparams,
+                                             n_prompt, n_cached, first, params.n_predict > 0 ? params.n_predict : 256,
+                                             params.cycle_cost_ms, hop_lat_ms, hop_bw);
+                }
+
                 if (n_prompt > 0) {
                     float serial_ms = 0.0f;
                     const float prefill_ms = predict_prefill_ms(n_world, dev_info_set.data(), n_layer_window, n_gpu_layers, model, cparams, n_prompt,
-                                                                hop_lat_ms.data(), hop_bw.data(), &serial_ms);
-                    LOG_INF("Prefill prediction: n_prompt = %d, n_batch = %u, n_ubatch = %u, prefill_pred_ms = %.1f (old serial schedule: %.1f ms)\n",
-                            n_prompt, cparams.n_batch, cparams.n_ubatch, prefill_ms, serial_ms);
-                    for (uint32_t m = 0; m < n_world; ++m) {
-                        const prefill_props & pp = dev_info_set[m].prefill;
-                        LOG_INF("  prefill props of rank %u: CPU mm_eff %.2f attn %.4f ns op %.1f us | GPU mm_eff %.2f attn %.4f ns op %.1f us h2d %.1f GB/s\n",
-                                m, pp.cpu_mm_eff, pp.cpu_attn_ns, pp.cpu_op_us, pp.gpu_mm_eff, pp.gpu_attn_ns, pp.gpu_op_us, pp.gpu_h2d_bw);
-                    }
-                    for (uint32_t r = 0; r < n_world; ++r) {
-                        LOG_INF("  network hop rank %u -> %u: latency %.3f ms, bandwidth %.2f GB/s\n",
-                                r, (r + 1) % n_world, hop_lat_ms[r], hop_bw[r]);
-                    }
+                                                                n_cached, first, hop_lat_ms.data(), hop_bw.data(), &serial_ms);
+                    LOG_INF("Prefill prediction: n_prompt = %d, n_cached = %d, first = %d, n_batch = %u, n_ubatch = %u, prefill_pred_ms = %.1f (old serial schedule: %.1f ms)\n",
+                            n_prompt, n_cached, first, cparams.n_batch, cparams.n_ubatch, prefill_ms, serial_ms);
+                    // what the weights missing from the page cache cost, in the first prefill or else in the warmup
+                    const float cold_ms = predict_prefill_ms(n_world, dev_info_set.data(), n_layer_window, n_gpu_layers, model, cparams, n_prompt,
+                                                             n_cached, true, hop_lat_ms.data(), hop_bw.data(), nullptr)
+                                        - predict_prefill_ms(n_world, dev_info_set.data(), n_layer_window, n_gpu_layers, model, cparams, n_prompt,
+                                                             n_cached, false, hop_lat_ms.data(), hop_bw.data(), nullptr);
+                    LOG_INF("  page cache misses cost %.1f ms of disk reads (%s)\n", cold_ms,
+                            params.warmup ? "in the warmup at startup" : "in the first prefill");
                 }
+                for (uint32_t m = 0; m < n_world; ++m) {
+                    const prefill_props & pp = dev_info_set[m].prefill;
+                    const uint32_t n_layer = std::min<uint32_t>(llama_model_n_layers(model), PREFILL_MAX_LAYERS);
+                    const double cached = std::accumulate(pp.cached_layer, pp.cached_layer + n_layer, 0.0) / n_layer;
+                    LOG_INF("  prefill props of rank %u: CPU mm_eff %.2f attn %.4f ns op %.1f us | GPU mm_eff %.2f attn %.4f ns op %.1f us h2d %.1f GB/s"
+                            " | page cache: layers %.0f%%, output %.0f%%\n",
+                            m, pp.cpu_mm_eff, pp.cpu_attn_ns, pp.cpu_op_us, pp.gpu_mm_eff, pp.gpu_attn_ns, pp.gpu_op_us, pp.gpu_h2d_bw,
+                            cached * 100, pp.cached_output * 100);
+                }
+                for (uint32_t r = 0; r < n_world; ++r) {
+                    LOG_INF("  network hop rank %u -> %u: latency %.3f ms, bandwidth %.2f GB/s\n",
+                            r, (r + 1) % n_world, hop_lat_ms[r], hop_bw[r]);
+                }
+
+                // keep what the prediction needs, for llama_predict_prefill_ms (e.g. per llama-server request)
+                g_prefill_predictor.valid          = true;
+                g_prefill_predictor.n_world        = n_world;
+                g_prefill_predictor.dev_info_set   = dev_info_set;
+                g_prefill_predictor.n_layer_window.assign(n_layer_window, n_layer_window + n_world);
+                g_prefill_predictor.n_gpu_layers  .assign(n_gpu_layers,   n_gpu_layers   + n_world);
+                g_prefill_predictor.model          = model;
+                g_prefill_predictor.cparams        = cparams;
+                g_prefill_predictor.hop_lat_ms     = hop_lat_ms;
+                g_prefill_predictor.hop_bw         = hop_bw;
+                g_prefill_predictor.warmed_up      = params.warmup;
 
                 llama_bcast_layer_setup(lctx, n_layer_window, n_gpu_layers);
                 llama_rebuild_topo     (lctx, n_layer_window, dev_info_set.data(), &node_type, is_forwarder);

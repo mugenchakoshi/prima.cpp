@@ -3618,6 +3618,8 @@ static bool is_dtype_exist(struct model_params * n_params, enum ggml_type dtype)
     }
 }
 
+static void llama_model_cached_fraction(const llama_model_loader * ml, uint32_t n_layer, struct prefill_props * props);
+
 void llama_profile_device(
                 device_info * dev_info, 
          struct llama_model * model, 
@@ -3759,6 +3761,7 @@ void llama_profile_device(
     }
 
     device_prefill_props(model, &dev_info->prefill, n_ubatch, n_threads);
+    llama_model_cached_fraction(ml, model->hparams.n_layer, &dev_info->prefill);
 }
 
 ggml_backend_buffer_type_t llama_dev_buffer_type(struct llama_model * model, int device) {
@@ -20827,6 +20830,8 @@ int llama_bcast_startup_args(llama_context * ctx, uint32_t rank, startup_args * 
             msgs.emplace_back(&args->should_profile, sizeof(args->should_profile));
             msgs.emplace_back("n_ctx", strlen("n_ctx"));
             msgs.emplace_back(&args->n_ctx, sizeof(args->n_ctx));
+            msgs.emplace_back("warmup", strlen("warmup"));
+            msgs.emplace_back(&args->warmup, sizeof(args->warmup));
             zmq::send_multipart(*ctx->send_socket, msgs);
         } catch (const zmq::error_t& e) {
             LLAMA_LOG_INFO("Failed to send data: %s\n", e.what());
@@ -20851,9 +20856,12 @@ int llama_bcast_startup_args(llama_context * ctx, uint32_t rank, startup_args * 
         GGML_ASSERT(msgs[1].size() == sizeof(bool));
         GGML_ASSERT(msgs[2].to_string() == "n_ctx");
         GGML_ASSERT(msgs[3].size() == sizeof(uint32_t));
+        GGML_ASSERT(msgs.size() == 6 && msgs[4].to_string() == "warmup");
+        GGML_ASSERT(msgs[5].size() == sizeof(bool));
 
         args->should_profile = *static_cast<bool*>(msgs[1].data());      
         args->n_ctx = *static_cast<uint32_t*>(msgs[3].data());
+        args->warmup = *static_cast<bool*>(msgs[5].data());
 
         // non-master ranks forward the startup args to their next rank
         try {
@@ -22441,6 +22449,68 @@ void llama_kv_size(
         *gpu_cache = 0;
         *cpu_cache = (nb_k + nb_v) * n_layer;
     }
+}
+
+// fraction of each layer's weights, and of the output layer's, that is in the page cache now. Every file
+// of the model is mapped read-only and mincore() reports which of its pages are resident, without reading
+// them. Without mincore (Windows) everything counts as cached
+static void llama_model_cached_fraction(const llama_model_loader * ml, uint32_t n_layer, struct prefill_props * props) {
+#if defined(_POSIX_MAPPED_FILES) && !defined(_WIN32)
+    const long page_size = sysconf(_SC_PAGESIZE);
+    std::vector<void *> maps(ml->files.size(), MAP_FAILED);
+    for (size_t i = 0; i < ml->files.size(); ++i) {
+        maps[i] = mmap(nullptr, ml->files[i]->size, PROT_READ, MAP_SHARED, fileno(ml->files[i]->fp), 0);
+    }
+
+    std::vector<double> resident(n_layer + 1, 0.0), total(n_layer + 1, 0.0); // [n_layer] is the output layer
+    bool has_output = false;
+    for (const auto & w : ml->weights) {
+        has_output = has_output || strcmp(ggml_get_name(w.tensor), "output.weight") == 0;
+    }
+    std::vector<unsigned char> vec;
+    for (const auto & w : ml->weights) {
+        const char * name = ggml_get_name(w.tensor);
+        int il = -1;
+        if (sscanf(name, "blk.%d.", &il) != 1) {
+            // the output layer reuses the token embeddings when the model ties them
+            if (strcmp(name, has_output ? "output.weight" : "token_embd.weight") != 0) {
+                continue;
+            }
+            il = n_layer;
+        }
+        if (il < 0 || il > (int)n_layer || maps[w.idx] == MAP_FAILED) {
+            continue;
+        }
+
+        size_t first = w.offs, last = w.offs + ggml_nbytes(w.tensor);
+        llama_mmap::align_range(&first, &last, page_size);
+        const size_t n_pages = (last - first) / page_size;
+        vec.resize(n_pages);
+        if (n_pages == 0 || mincore((char *)maps[w.idx] + first, last - first, vec.data()) != 0) {
+            continue;
+        }
+        size_t n_resident = 0;
+        for (unsigned char v : vec) {
+            n_resident += v & 1;
+        }
+        resident[il] += n_resident;
+        total[il]    += n_pages;
+    }
+
+    for (size_t i = 0; i < maps.size(); ++i) {
+        if (maps[i] != MAP_FAILED) {
+            munmap(maps[i], ml->files[i]->size);
+        }
+    }
+    for (uint32_t il = 0; il < n_layer && il < PREFILL_MAX_LAYERS; ++il) {
+        props->cached_layer[il] = total[il] > 0 ? resident[il] / total[il] : 1.0f;
+    }
+    props->cached_output = total[n_layer] > 0 ? resident[n_layer] / total[n_layer] : 1.0f;
+#else
+    GGML_UNUSED(ml);
+    GGML_UNUSED(n_layer);
+    GGML_UNUSED(props);
+#endif
 }
 
 void llama_model_n_flops(

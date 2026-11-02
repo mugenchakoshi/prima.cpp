@@ -777,6 +777,34 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_env("LLAMA_ARG_K"));
     add_opt(llama_arg(
+        {"--halda-e2e"},
+        format("choose the number of cycles by the predicted time of a whole request, TTFT + n_predict x TPOT, instead of TPOT alone (default: %s)", params.halda_e2e ? "true" : "false"),
+        [](gpt_params & params) {
+            params.halda_e2e = true;
+        }
+    ).set_env("LLAMA_ARG_HALDA_E2E"));
+    add_opt(llama_arg(
+        {"--expected-prompt"}, "N",
+        format("prompt length the layer assignment plans for when no prompt is given, e.g. llama-server (default: %d)", params.expected_prompt),
+        [](gpt_params & params, int value) {
+            params.expected_prompt = value;
+        }
+    ).set_env("LLAMA_ARG_EXPECTED_PROMPT"));
+    add_opt(llama_arg(
+        {"--expected-cache-hit"}, "F",
+        format("fraction of the prompt expected to hit the KV cache (prompt cache), for the prefill prediction (default: %.2f)", params.expected_cache_hit),
+        [](gpt_params & params, const std::string & value) {
+            params.expected_cache_hit = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_EXPECTED_CACHE_HIT"));
+    add_opt(llama_arg(
+        {"--cycle-cost-ms"}, "MS",
+        format("decode cost in ms of each switch to another device's window (send / receive, copies, graph launch), for --halda-e2e (default: %.2f)", params.cycle_cost_ms),
+        [](gpt_params & params, const std::string & value) {
+            params.cycle_cost_ms = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_CYCLE_COST_MS"));
+    add_opt(llama_arg(
         {"--force"},
         format("force to start prefetching after computation (default: %s)", params.force ? "true" : "false"),
         [](gpt_params & params) {
@@ -1037,13 +1065,14 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             params.enable_chat_template = false;
         }
     ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_INFILL}));
-    // add_opt(llama_arg(
-    //     {"--no-warmup"},
-    //     "skip warming up the model with an empty run",
-    //     [](gpt_params & params) {
-    //         params.warmup = false;
-    //     }
-    // ).set_examples({LLAMA_EXAMPLE_MAIN}));
+    // rank 0 sends this to the other ranks at startup, so that they skip the warmup too
+    add_opt(llama_arg(
+        {"--no-warmup"},
+        "skip warming up the model with an empty run (on rank 0; the other ranks follow)",
+        [](gpt_params & params) {
+            params.warmup = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
         {"--spm-infill"},
         format(

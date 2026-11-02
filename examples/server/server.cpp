@@ -217,6 +217,7 @@ struct server_slot {
     int64_t t_start_generation;
 
     double t_prompt_processing; // ms
+    double t_prompt_pred = -1.0; // predicted prompt processing time in ms (-1: no prediction)
     double t_token_generation; // ms
 
     std::function<void(int)> callback_on_release;
@@ -289,6 +290,7 @@ struct server_slot {
             {"prompt_ms",              t_prompt_processing},
             {"prompt_per_token_ms",    t_prompt_processing / n_prompt_tokens_processed},
             {"prompt_per_second",      1e3 / t_prompt_processing * n_prompt_tokens_processed},
+            {"prompt_pred_ms",         t_prompt_pred},
 
             {"predicted_n",            n_decoded},
             {"predicted_ms",           t_token_generation},
@@ -2269,6 +2271,13 @@ struct server_context {
                         }
 
                         slot.n_prompt_tokens_processed = 0;
+
+                        // predicted prompt time with the cached prefix (n_past tokens) skipped
+                        static bool first_prompt = true;
+                        slot.t_prompt_pred = llama_predict_prefill_ms(slot.n_prompt_tokens, slot.n_past, first_prompt);
+                        first_prompt = false;
+                        SLT_INF(slot, "prefill prediction: n_prompt = %d, n_cached = %d, pred = %.1f ms\n",
+                                slot.n_prompt_tokens, slot.n_past, slot.t_prompt_pred);
                     }
 
                     // non-causal tasks require to fit the entire prompt in the physical batch

@@ -3,6 +3,8 @@
 
 #include "ggml.h"
 #include "llama.h"
+#include <algorithm>
+#include <iterator>
 
 #define EPS                  1e-9f
 #define DISK_TEST_TOTAL_BYTE 500L * 1024 * 1024
@@ -327,6 +329,8 @@ struct disk_props {
 };
 
 // prefill-shaped benchmarks, used to predict the prompt processing time. 0 means not measured
+#define PREFILL_MAX_LAYERS 256
+
 struct prefill_props {
     float cpu_mm_eff;  // matmul FLOPS at a layer's shape (n_embd x n_ff, n_ubatch tokens) / the square matmul benchmark
     float cpu_attn_ns; // ns per attention score (one head, one query, one KV cell) through KQ, softmax and KQV
@@ -336,6 +340,11 @@ struct prefill_props {
     float gpu_op_us;
     float gpu_h2d_bw;  // host to GPU copy bandwidth in GB/s, for CPU-resident weights the GPU computes in prefill
 
+    // fraction of each layer's weights (and of the output layer's) in the page cache at startup. The mmap-ed
+    // weights that are not there are read from disk the first time they are used, in the first prefill
+    float cached_layer[PREFILL_MAX_LAYERS];
+    float cached_output;
+
     prefill_props() :
         cpu_mm_eff (0.0f),
         cpu_attn_ns(0.0f),
@@ -343,12 +352,16 @@ struct prefill_props {
         gpu_mm_eff (0.0f),
         gpu_attn_ns(0.0f),
         gpu_op_us  (0.0f),
-        gpu_h2d_bw (0.0f) {}
+        gpu_h2d_bw (0.0f),
+        cached_output(1.0f) {
+        std::fill(std::begin(cached_layer), std::end(cached_layer), 1.0f); // unknown: assume cached
+    }
 };
 
 struct startup_args{
     bool     should_profile;
     uint32_t n_ctx;
+    bool     warmup; // every rank runs the warmup decode, or none does
 };
 
 struct device_info {
