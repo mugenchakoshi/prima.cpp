@@ -1718,7 +1718,13 @@ static float device_token_compute_ms(const device_info & dev, const model_flops 
 // On a device with a GPU, the CPU layers of a ubatch of 32+ tokens also run on the GPU and upload their
 // weights over PCIe every ubatch. Without prefill_props (0), the matmuls fall back to the square FLOPS plus one weight read per ubatch
 // and attention to its FLOPs over the f16 FLOPS. Layers that do not fit in RAM are read from disk once
-// per window pass. Communication is ignored, there is no network profiling yet
+// per window pass.
+// When a ubatch moves to another device, its activations (n x n_embd f32) are copied into a zmq message
+// by the sender and out of it by the receiver, plus a D2H / H2D copy on a device that computes on its GPU.
+// Both are charged to the devices. The transfer itself goes over the hops of the ring (through forwarders
+// too) with the latency and bandwidth measured by llama_profile_network (hop_lat_ms / hop_bw, indexed by
+// the sending rank, nullptr to ignore the network), and the link of a device carries one ubatch at a time
+// while the devices keep computing
 static float predict_prefill_ms(
                                 uint32_t   n_world,
                        const device_info * dev_info_set,
@@ -1727,6 +1733,8 @@ static float predict_prefill_ms(
                       struct llama_model * model,
        const struct llama_context_params & cparams,
                                      int   n_prompt,
+                             const float * hop_lat_ms,
+                             const float * hop_bw,
                                    float * serial_ms) {
     const model_flops & mf      = dev_info_set[0].model_flops;
     const int64_t       b       = dev_info_set[0].model_bytes.nb_layer;
@@ -1817,6 +1825,64 @@ static float predict_prefill_ms(
         out_ms = device_token_compute_ms(master, mf, false, true) + bo / (master.memory.cpu_read_ram_bw * 1e9 + EPS) * 1000;
     }
 
+    // stages of a ubatch: rank 0's embedding, the windows in ring order once per cycle, and back to rank 0
+    // for the output layer when rank 0 holds no layers
+    std::vector<uint32_t> seq = {0};
+    for (uint32_t c = 0; c < k; ++c) {
+        seq.insert(seq.end(), ring.begin(), ring.end());
+    }
+    if (seq.back() != 0) {
+        seq.push_back(0);
+    }
+
+    // activations of a ubatch of n tokens as sent between devices
+    auto act_bytes = [&](int n) { return (double)n * n_embd * sizeof(float); };
+
+    // network time to move a ubatch from device a to device b over the ring hops a, a+1, ..., b-1
+    auto hop_ms = [&](uint32_t a, uint32_t b, int n) {
+        double ms = 0.0;
+        if (hop_lat_ms == nullptr || hop_bw == nullptr) {
+            return ms;
+        }
+        for (uint32_t r = a; r != b; r = (r + 1) % n_world) {
+            ms += hop_lat_ms[r] + (hop_bw[r] > 0.0f ? act_bytes(n) / (hop_bw[r] * 1e9) * 1000 : 0.0);
+        }
+        return ms;
+    };
+
+    // copies of a ubatch's activations on device m when it sends or receives them: one memcpy between the
+    // zmq message and RAM, and one PCIe copy when the window computes on the GPU (not the embedding)
+    auto copy_ms = [&](uint32_t m, int n, bool window) {
+        const device_info & dev = dev_info_set[m];
+        const bool has_gpu = dev.gpu_support.cuda || dev.gpu_support.metal;
+        double ms = act_bytes(n) / (dev.memory.cpu_read_ram_bw * 1e9 + EPS) * 1000;
+        if (window && has_gpu && dev.prefill.gpu_h2d_bw > 0.0f && n_layer_window[m] > 0 && (n_gpu_layers[m] > 0 || n >= 32)) {
+            ms += act_bytes(n) / (dev.prefill.gpu_h2d_bw * 1e9) * 1000;
+        }
+        return ms;
+    };
+
+    // time of stage i for one ubatch, without the disk reads, including the copies on either side of it
+    auto stage_ms = [&](size_t i, int n, int kv) {
+        const uint32_t m = seq[i];
+        double ms;
+        if (i == 0) {
+            ms = master.model_flops.inp_embd_ms * n;
+        } else if (i == seq.size() - 1 && n_layer_window[m] == 0) {
+            ms = 0.0; // rank 0 only receives the result for the output layer
+        } else {
+            ms = window_ms(m, n, kv);
+        }
+        if (i > 0 && seq[i - 1] != m) {
+            ms += copy_ms(m, n, true);
+        }
+        if (i + 1 < seq.size() && seq[i + 1] != m) {
+            ms += copy_ms(m, n, i > 0);
+        }
+        return ms;
+    };
+    auto stage_disk_ms = [&](size_t i) { return i == 0 || n_layer_window[seq[i]] == 0 ? 0.0 : disk_ms[seq[i]]; };
+
     double t_pipe = 0.0, t_serial = 0.0;
     for (int pos = 0; pos < n_prompt; pos += cparams.n_batch) {
         const int n_chunk = std::min<int>(cparams.n_batch, n_prompt - pos);
@@ -1829,46 +1895,42 @@ static float predict_prefill_ms(
         const size_t n_ub = ub_n.size();
 
         // old schedule: every ubatch goes around the ring alone
+        double t_chunk_serial = 0.0;
         for (size_t u = 0; u < n_ub; ++u) {
-            t_serial += master.model_flops.inp_embd_ms * ub_n[u];
-            for (uint32_t c = 0; c < k; ++c) {
-                for (uint32_t m : ring) {
-                    t_serial += disk_ms[m] + window_ms(m, ub_n[u], ub_kv[u]);
+            for (size_t i = 0; i < seq.size(); ++i) {
+                if (i > 0) {
+                    t_chunk_serial += hop_ms(seq[i - 1], seq[i], ub_n[u]);
                 }
+                t_chunk_serial += stage_disk_ms(i) + stage_ms(i, ub_n[u], ub_kv[u]);
             }
         }
-        t_serial += out_ms;
+        t_chunk_serial += out_ms;
+        t_serial += t_chunk_serial;
 
         if (!tiled || n_ub == 1) {
             // not pipelined, same as the old schedule for this chunk
-            for (size_t u = 0; u < n_ub; ++u) {
-                t_pipe += master.model_flops.inp_embd_ms * ub_n[u];
-                for (uint32_t c = 0; c < k; ++c) {
-                    for (uint32_t m : ring) {
-                        t_pipe += disk_ms[m] + window_ms(m, ub_n[u], ub_kv[u]);
-                    }
-                }
-            }
-            t_pipe += out_ms;
+            t_pipe += t_chunk_serial;
             continue;
         }
 
-        // window-major: simulate when each stage finishes each ubatch
-        std::vector<double> dev_free(n_world, t_pipe), done(n_ub, t_pipe);
-        for (size_t u = 0; u < n_ub; ++u) {
-            dev_free[0] += master.model_flops.inp_embd_ms * ub_n[u];
-            done[u] = dev_free[0];
-        }
-        for (uint32_t c = 0; c < k; ++c) {
-            for (uint32_t m : ring) {
-                dev_free[m] += disk_ms[m];
+        // window-major: simulate when each stage, and each link between two stages, finishes each ubatch
+        std::vector<double> dev_free(n_world, t_pipe), link_free(n_world, t_pipe), ready(n_ub, t_pipe);
+        for (size_t i = 0; i < seq.size(); ++i) {
+            const uint32_t m = seq[i];
+            if (i > 0 && seq[i - 1] != m) {
+                const uint32_t a = seq[i - 1];
                 for (size_t u = 0; u < n_ub; ++u) {
-                    dev_free[m] = std::max(dev_free[m], done[u]) + window_ms(m, ub_n[u], ub_kv[u]);
-                    done[u] = dev_free[m];
+                    link_free[a] = std::max(link_free[a], ready[u]) + hop_ms(a, m, ub_n[u]);
+                    ready[u] = link_free[a];
                 }
             }
+            dev_free[m] += stage_disk_ms(i);
+            for (size_t u = 0; u < n_ub; ++u) {
+                dev_free[m] = std::max(dev_free[m], ready[u]) + stage_ms(i, ub_n[u], ub_kv[u]);
+                ready[u] = dev_free[m];
+            }
         }
-        t_pipe = done[n_ub - 1] + out_ms;
+        t_pipe = ready[n_ub - 1] + out_ms;
     }
 
     if (serial_ms) {
@@ -1979,6 +2041,17 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
             cparams.n_ctx = args.n_ctx;
         }
 
+        // measure every hop of the ring with a ubatch of activations, before the device profiling loads the
+        // machines. Only rank 0 gets the results, for the prefill prediction
+        std::vector<float> hop_lat_ms(n_world, 0.0f), hop_bw(n_world, 0.0f);
+        if (auto_schedule) {
+            const size_t n_bytes = (size_t)params.n_ubatch * llama_n_embd(model) * sizeof(float);
+            if (llama_profile_network(lctx, my_rank, n_bytes, 3, hop_lat_ms.data(), hop_bw.data()) != 0) {
+                std::fill(hop_bw.begin(), hop_bw.end(), 0.0f);
+                std::fill(hop_lat_ms.begin(), hop_lat_ms.end(), 0.0f);
+            }
+        }
+
         // if n_world > 1 and need auto schdule, then prifile
         if (auto_schedule){
             // get device profile
@@ -2012,13 +2085,18 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
                 if (!params.prompt.empty()) {
                     const int n_prompt = llama_tokenize(model, params.prompt, true, true).size();
                     float serial_ms = 0.0f;
-                    const float prefill_ms = predict_prefill_ms(n_world, dev_info_set.data(), n_layer_window, n_gpu_layers, model, cparams, n_prompt, &serial_ms);
+                    const float prefill_ms = predict_prefill_ms(n_world, dev_info_set.data(), n_layer_window, n_gpu_layers, model, cparams, n_prompt,
+                                                                hop_lat_ms.data(), hop_bw.data(), &serial_ms);
                     LOG_INF("Prefill prediction: n_prompt = %d, n_batch = %u, n_ubatch = %u, prefill_pred_ms = %.1f (old serial schedule: %.1f ms)\n",
                             n_prompt, cparams.n_batch, cparams.n_ubatch, prefill_ms, serial_ms);
                     for (uint32_t m = 0; m < n_world; ++m) {
                         const prefill_props & pp = dev_info_set[m].prefill;
                         LOG_INF("  prefill props of rank %u: CPU mm_eff %.2f attn %.4f ns op %.1f us | GPU mm_eff %.2f attn %.4f ns op %.1f us h2d %.1f GB/s\n",
                                 m, pp.cpu_mm_eff, pp.cpu_attn_ns, pp.cpu_op_us, pp.gpu_mm_eff, pp.gpu_attn_ns, pp.gpu_op_us, pp.gpu_h2d_bw);
+                    }
+                    for (uint32_t r = 0; r < n_world; ++r) {
+                        LOG_INF("  network hop rank %u -> %u: latency %.3f ms, bandwidth %.2f GB/s\n",
+                                r, (r + 1) % n_world, hop_lat_ms[r], hop_bw[r]);
                     }
                 }
 

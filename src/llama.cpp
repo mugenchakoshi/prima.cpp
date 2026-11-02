@@ -20872,6 +20872,82 @@ int llama_bcast_startup_args(llama_context * ctx, uint32_t rank, startup_args * 
     return 0;
 }
 
+// Measure every hop of the ring with rank 0's clock only. Rank 0 starts a message around the ring and
+// times its return. In a "small" lap every rank forwards a few bytes. In the lap for hop r, rank r sends
+// n_bytes to rank r+1 instead, so (lap time - small lap time) is the transfer time of n_bytes over hop r.
+// The small lap time split evenly over the hops gives the per-hop latency. Each lap is repeated n_rounds
+// times after a warm-up and the fastest one is kept. Only rank 0 chooses n_bytes (the laps carry it) and
+// gets results: hop_lat_ms[r] and hop_bw[r] (GB/s) describe the hop from rank r to rank r+1.
+int llama_profile_network(struct llama_context * ctx, uint32_t rank, size_t n_bytes, int n_rounds, float * hop_lat_ms, float * hop_bw) {
+    const int32_t n_world = ctx->cparams.n_world;
+    if (n_world == 1) return 0;
+    GGML_ASSERT(ctx != nullptr && ctx->send_socket != nullptr && ctx->recv_socket != nullptr);
+
+    struct lap { int32_t hop; uint64_t n_bytes; }; // hop: the rank sending the payload, SMALL or STOP
+    const int32_t STOP = -2, SMALL = -1;
+    std::vector<char> payload;
+    static char small[8] = {0}; // static: the last zero-copy send may still be queued when we return
+
+    // payloads are sent zero-copy, so the measured time is the transfer and not a memcpy into zmq
+    auto send_lap = [&](lap l) {
+        std::vector<zmq::message_t> msgs;
+        msgs.emplace_back(&l, sizeof(l));
+        if (l.hop == (int32_t)rank) {
+            payload.resize(l.n_bytes);
+            msgs.emplace_back(payload.data(), payload.size(), nullptr, nullptr);
+        } else {
+            msgs.emplace_back(small, sizeof(small), nullptr, nullptr);
+        }
+        zmq::send_multipart(*ctx->send_socket, msgs);
+    };
+    auto recv_lap = [&]() {
+        std::vector<zmq::message_t> msgs;
+        if (!zmq::recv_multipart(*ctx->recv_socket, std::back_inserter(msgs)) || msgs.size() != 2 || msgs[0].size() != sizeof(lap)) {
+            return lap{STOP, 0};
+        }
+        return *static_cast<lap *>(msgs[0].data());
+    };
+
+    try {
+        if (rank == 0) {
+            std::vector<double> best(n_world + 1, 1e30); // [0] small lap, [r + 1] lap for hop r
+            for (int round = 0; round <= n_rounds; ++round) {
+                for (int32_t hop = SMALL; hop < n_world; ++hop) {
+                    const int64_t t0 = ggml_time_us();
+                    send_lap({hop, n_bytes});
+                    if (recv_lap().hop != hop) {
+                        LLAMA_LOG_INFO("%s: unexpected network probe message\n", __func__);
+                        return -1;
+                    }
+                    const double ms = (ggml_time_us() - t0) / 1000.0;
+                    if (round > 0) { // round 0 warms up the connections
+                        best[hop + 1] = std::min(best[hop + 1], ms);
+                    }
+                }
+            }
+            send_lap({STOP, 0});
+            recv_lap();
+
+            for (int32_t r = 0; r < n_world; ++r) {
+                hop_lat_ms[r] = best[0] / n_world;
+                const double dt = best[r + 1] - best[0];
+                hop_bw[r] = dt > 0.0 ? n_bytes / (dt * 1e-3) / 1e9 : 0.0f;
+            }
+        } else {
+            // forward every lap, sending the payload on our own hop, until rank 0 stops the probe
+            lap l;
+            do {
+                l = recv_lap();
+                send_lap(l);
+            } while (l.hop != STOP);
+        }
+    } catch (const zmq::error_t & e) {
+        LLAMA_LOG_INFO("%s: failed to probe the network: %s\n", __func__, e.what());
+        return -1;
+    }
+    return 0;
+}
+
 int llama_bcast_layer_setup(struct llama_context * ctx, uint32_t * n_layer_window, uint32_t * n_gpu_layers) {
     uint32_t n_world = ctx->cparams.n_world;
     if (n_world == 1) return 0;
