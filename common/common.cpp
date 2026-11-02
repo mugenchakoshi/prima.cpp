@@ -864,6 +864,7 @@ static bool assign_layers_to_device(
                                 uint32_t * n_gpu_layers,
                       struct llama_model * model,
        const struct llama_context_params   cparams,
+                                     int   n_prompt,
                                    float   min_disk_read_speed = 0.1f) { // minimum disk I/O speed: 100 MB/s
     GGML_ASSERT(dev_info_set != nullptr);
     GGML_ASSERT(n_layer_window != nullptr);
@@ -884,9 +885,19 @@ static bool assign_layers_to_device(
 
     const int64_t b        = dev_info_set[0].model_bytes.nb_layer;
     const int64_t bo       = dev_info_set[0].model_bytes.nb_output;
+    // per-layer bytes in memory: the weights and the KV cache, which is allocated for all n_ctx cells
     const int64_t b_prime  = b + 2 * (n_embd_k_gqa + n_embd_v_gqa) * n_kv;
 
 #if defined(USE_HIGHS) 
+    // KV cells a decode step actually reads: the average over the generation, which starts after the
+    // prompt and ends after n_predict tokens or when the context is full (n_predict = -1 is unlimited)
+    const int64_t n_gen_end = std::min<int64_t>(n_kv, (int64_t)n_prompt + cparams.n_predict);
+    const int64_t n_kv_read = std::max<int64_t>(1, (n_prompt + n_gen_end) / 2);
+    // per-layer bytes a decode step reads from RAM / VRAM: the weights and the KV cells in use
+    const int64_t b_read    = b + 2 * (n_embd_k_gqa + n_embd_v_gqa) * n_kv_read;
+    LOG_INF("Halda: KV cells read per decode step = %" PRId64 " (n_prompt = %d, n_predict = %d, n_ctx = %d)\n",
+            n_kv_read, n_prompt, (int)cparams.n_predict, n_kv);
+
     const device_info &master = dev_info_set[0];
     const int n_vocab = llama_n_vocab(model);
     const int64_t bi  = dev_info_set[0].model_bytes.nb_input;
@@ -918,7 +929,7 @@ static bool assign_layers_to_device(
             master.model_flops.layer_iq1m_f32  / (dev.cpu_props.flops_iq1m_f32  * 1e9 + EPS) ) * 1000; // in ms
 
         float t_kv_cpy_cpu = dev.memory.mem_cpy_delay; // in ms
-        t_read_ram_cpu = b_prime / (dev.memory.cpu_read_ram_bw * 1e9) * 1000; // in ms
+        t_read_ram_cpu = b_read / (dev.memory.cpu_read_ram_bw * 1e9) * 1000; // in ms
 
         alpha[m] = t_calc_cpu + t_kv_cpy_cpu + t_read_ram_cpu; // in ms
 
@@ -944,7 +955,7 @@ static bool assign_layers_to_device(
                     master.model_flops.layer_iq1m_f32   / (dev.gpu_props.metal_flops_iq1m_f32   * 1e9 + EPS) ) * 1000; // in ms
 
                 t_kv_cpy_gpu = dev.gpu_props.metal_mem_cpy_delay; // in ms
-                t_read_ram_gpu = b_prime / (dev.gpu_props.metal_read_vram_bw * 1e9) * 1000; // in ms
+                t_read_ram_gpu = b_read / (dev.gpu_props.metal_read_vram_bw * 1e9) * 1000; // in ms
             } else {
                 t_calc_gpu = (
                     master.model_flops.layer_f32_f32    / (dev.gpu_props.cuda_flops_f32_f32    * 1e9 + EPS) +
@@ -961,7 +972,7 @@ static bool assign_layers_to_device(
                     master.model_flops.layer_iq1m_f32   / (dev.gpu_props.cuda_flops_iq1m_f32   * 1e9 + EPS) ) * 1000; // in ms
 
                 t_kv_cpy_gpu = dev.gpu_props.cuda_mem_cpy_delay; // in ms
-                t_read_ram_gpu = b_prime / (dev.gpu_props.cuda_read_vram_bw * 1e9) * 1000; // in ms
+                t_read_ram_gpu = b_read / (dev.gpu_props.cuda_read_vram_bw * 1e9) * 1000; // in ms
             }
             beta[m] = t_calc_gpu - t_calc_cpu + t_kv_cpy_gpu - t_kv_cpy_cpu + t_read_ram_gpu - t_read_ram_cpu; // in ms
         }
@@ -1530,6 +1541,7 @@ static bool assign_layers_to_device(
 
 #else
     (void)min_disk_read_speed;
+    (void)n_prompt;
 
     // assign layers according to RAM/VRAM
     for (uint32_t m = 0; m < n_world; ++m) {
@@ -1598,7 +1610,8 @@ static bool assign_layers_and_select_devices(
                                 uint32_t * n_layer_window, 
                                 uint32_t * n_gpu_layers,
                       struct llama_model * model,
-       const struct llama_context_params   cparams) {
+       const struct llama_context_params   cparams,
+                                     int   n_prompt) {
     memset(n_layer_window, 0, n_world * sizeof(uint32_t));
     memset(n_gpu_layers,   0, n_world * sizeof(uint32_t));
 
@@ -1610,7 +1623,7 @@ static bool assign_layers_and_select_devices(
         std::vector<uint32_t> n_layer_windows_(n_world, 0), n_gpu_layers_(n_world, 0);
         
         if (!assign_layers_to_device(n_world, dev_infos_.data(), 
-                                     n_layer_windows_.data(), n_gpu_layers_.data(), model, cparams)) {
+                                     n_layer_windows_.data(), n_gpu_layers_.data(), model, cparams, n_prompt)) {
             return false;
         }
 
@@ -2074,16 +2087,17 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
                 llama_gather_device_info(lctx, dev_info_set.data());
                 device_print_props      (dev_info_set.data(), n_world, model, cparams);
 
-                // assign layers to devices and remove weak devices
-                if (!assign_layers_and_select_devices(n_world, dev_info_set, n_layer_window, n_gpu_layers, model, cparams)) {
+                // assign layers to devices and remove weak devices. The prompt length sets how much of the
+                // KV cache a decode step reads (0 when the prompt is not known yet, e.g. llama-server)
+                const int n_prompt = params.prompt.empty() ? 0 : (int)llama_tokenize(model, params.prompt, true, true).size();
+                if (!assign_layers_and_select_devices(n_world, dev_info_set, n_layer_window, n_gpu_layers, model, cparams, n_prompt)) {
                     LOG_ERR("%s: Invalid allocation by HiGHS solver\n", __func__);
                     llama_free(lctx);
                     llama_free_model(model);
                     return iparams;
                 }
 
-                if (!params.prompt.empty()) {
-                    const int n_prompt = llama_tokenize(model, params.prompt, true, true).size();
+                if (n_prompt > 0) {
                     float serial_ms = 0.0f;
                     const float prefill_ms = predict_prefill_ms(n_world, dev_info_set.data(), n_layer_window, n_gpu_layers, model, cparams, n_prompt,
                                                                 hop_lat_ms.data(), hop_bw.data(), &serial_ms);
