@@ -778,7 +778,7 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
     ).set_env("LLAMA_ARG_K"));
     add_opt(llama_arg(
         {"--halda-e2e"},
-        format("choose the number of cycles by the predicted time of a whole request, TTFT + n_predict x TPOT, instead of TPOT alone (default: %s)", params.halda_e2e ? "true" : "false"),
+        format("choose the layer assignment (cycles, windows, GPU layers) by the predicted time of a whole request, TTFT + n_predict x TPOT, instead of Halda's TPOT alone (default: %s)", params.halda_e2e ? "true" : "false"),
         [](gpt_params & params) {
             params.halda_e2e = true;
         }

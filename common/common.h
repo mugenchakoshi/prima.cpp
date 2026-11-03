@@ -172,7 +172,7 @@ struct gpt_params {
     float   master_priority       =  1.01; // priority to assign workload to the master (set 1.01 to use master first, and 0.99 to offload to other devices)
     int32_t gpu_mem               = 999.0; // gpu memory to use, in GiB
     int32_t n_cycles              =     0; // number of cycles to output one token
-    bool    halda_e2e             = false; // choose the number of cycles by predicted TTFT + n_predict x TPOT, not TPOT alone
+    bool    halda_e2e             = false; // choose the layer assignment by predicted TTFT + n_predict x TPOT, not TPOT alone
     int32_t expected_prompt       =     0; // prompt length to plan for when no prompt is given (e.g. llama-server)
     float   expected_cache_hit    =  0.0f; // fraction of the prompt expected to hit the KV cache (prompt cache)
     float   cycle_cost_ms         =  0.0f; // decode cost of each switch to another device's window, for --halda-e2e

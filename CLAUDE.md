@@ -79,9 +79,11 @@ Check these before you treat a Halda prediction as meaningful:
 
 - Several memory-read terms (`t_read_ram_*`) are commented out upstream. The `halda-mem-read` branch re-enables them.
 - `kappa` uses layer FLOPs rather than the output-layer FLOPs.
-- `xi` stays 0 inside the LP. `--halda-e2e` adds the measured network latency and `--cycle-cost-ms` (a per-device-switch decode cost, not profiled) only when it compares cycle counts.
+- `xi` stays 0 inside the LP. `--halda-e2e` scores candidates with the measured network and `--cycle-cost-ms` (a per-device-switch decode cost, not profiled).
 - On this branch, the decode memory-read term uses the KV length in use (prompt + half of `n_predict`). Capacity and disk terms still use `n_ctx`, which is what gets allocated. Attention FLOPs (`llama_model_n_flops`) still ignore the prompt length.
-- The Halda LP models only decode (TPOT). On this branch, `predict_prefill_ms` (common.cpp) predicts prefill separately. It covers the pipelined schedule, the network, prompt-cache hits and page-cache misses. `--halda-e2e` picks k by TTFT + n_predict × TPOT.
+- The Halda LP models only decode (TPOT). On this branch, `predict_prefill_ms` (common.cpp) predicts prefill separately. It covers the pipelined schedule, the network, prompt-cache hits and page-cache misses. `--halda-e2e` (`search_assignment_end_to_end`) searches k, the windows and the GPU layers by TTFT + n_predict × TPOT. Both TTFT and TPOT come from this predictor; a decode step is predicted as a 1-token prefill.
+- With every layer on the GPU and xi = 0, Halda's objective is the same for every k, so its choice of k is arbitrary. Its CUDA VRAM model also ignores `--keep-out-in-cuda`, so it can pick a k that runs out of VRAM.
+- The predictor underestimates decode with CPU layers (0.3–0.4×): CPU matvec runs well below the profiled RAM bandwidth, and GPU↔CPU switches inside a window are not modeled. Trust `--halda-e2e` only for all-GPU setups.
 - When the problem is infeasible, Halda now returns false instead of asserting (this branch).
 
 ## Prefill prediction (this branch)

@@ -2042,19 +2042,24 @@ float llama_predict_prefill_ms(int n_prompt, int n_cached, bool first) {
                               n_prompt, n_cached, first && !p.warmed_up, p.hop_lat_ms.data(), p.hop_bw.data(), nullptr);
 }
 
-// Halda minimizes the decode time per token (TPOT) only. This picks the number of cycles k by the predicted
-// time of a whole request instead: TTFT + n_gen x TPOT. Halda is solved again with each k forced (each is a
-// TPOT-optimal assignment for that k, the same candidates Halda compares), and the prefill of the expected
-// prompt is predicted for each. The TPOT also gets the per-cycle costs Halda leaves out (xi = 0): a decode
-// token goes k times around the ring hops (measured network latency), and every switch to another device's
-// window costs cycle_cost_ms more (send / receive, copies, graph launch; not profiled yet: on rpc1 + rpc2,
-// 70B, TPOT grows by about 1.1 ms per switch). On return, the arrays and tpot_ms hold the chosen assignment
-static void select_cycles_end_to_end(
+// Halda minimizes the decode time per token (TPOT) only. This searches the whole assignment — the number of
+// cycles k, each device's window w_m and its GPU layers n_m — for the least predicted time of a request:
+// TTFT + n_gen x TPOT. Every candidate is scored by the same model, predict_prefill_ms:
+//   - TTFT: the prefill of the expected prompt (n_cached tokens hitting the KV cache)
+//   - TPOT: one token after n_kv cached ones, which is what a decode step computes (n_kv = the prompt plus
+//     half the generation), plus cycle_cost_ms for every switch to another device's window (send / receive,
+//     copies, graph launch; not profiled yet: on rpc1 + rpc2, 70B, about 1.1 ms per switch)
+// A device runs as many of its layers on its GPU as fit in its free VRAM (with the KV cache of n_ctx cells
+// and its compute buffer), since a GPU layer is faster in both prefill and decode. Rank 0 keeps at least
+// one layer; other devices may get none (they are then dropped from the ring, as Halda does). The windows
+// are searched exhaustively when there are few enough compositions, else by moving one layer at a time
+// between two devices from Halda's solution while that improves the score. Halda's own solution is scored
+// the same way and kept unless a candidate beats it. On return, the arrays hold the chosen assignment
+static void search_assignment_end_to_end(
                                 uint32_t   n_world,
                 const std::vector<device_info> & dev_info_set,
                                 uint32_t * n_layer_window,
                                 uint32_t * n_gpu_layers,
-                                   float * tpot_ms,
                       struct llama_model * model,
        const struct llama_context_params & cparams,
                                      int   n_prompt,
@@ -2065,67 +2070,169 @@ static void select_cycles_end_to_end(
                 const std::vector<float> & hop_lat_ms,
                 const std::vector<float> & hop_bw) {
     const uint32_t n_layer = llama_model_n_layers(model);
-    const double   tok_bytes = (double)llama_n_embd(model) * sizeof(float);
+    const int      n_kv    = std::min<int>(cparams.n_ctx - 1, n_prompt + n_gen / 2);
+    const int64_t  b       = dev_info_set[0].model_bytes.nb_layer;
+    const int64_t  bo      = dev_info_set[0].model_bytes.nb_output;
+    const int64_t  b_gpu   = b + 2 * (int64_t)(llama_model_n_embd_k_gqa(model) + llama_model_n_embd_v_gqa(model)) * cparams.n_ctx;
 
-    // network time of one decode token for one lap around the ring, through every hop
-    double lap_ms = 0.0;
-    for (uint32_t r = 0; r < n_world; ++r) {
-        lap_ms += hop_lat_ms[r] + (hop_bw[r] > 0.0f ? tok_bytes / (hop_bw[r] * 1e9) * 1000 : 0.0);
+    // the most layers each device can hold on its GPU over all cycles
+    std::vector<int64_t> gpu_cap(n_world, 0);
+    for (uint32_t m = 0; m < n_world; ++m) {
+        const device_info & dev = dev_info_set[m];
+        if (!(dev.gpu_support.cuda || dev.gpu_support.metal)) {
+            continue;
+        }
+        int64_t c_cpu = 0, c_gpu = 0;
+        llama_model_compute_buf_size(&c_cpu, &c_gpu, model, cparams, get_backend_type(dev.gpu_support), m, dev.model_bytes, true, true);
+        int64_t avail = (int64_t)(dev.gpu_props.memory_free * GIGABYTE) - c_gpu;
+        if (m == 0 && cparams.keep_out_in_cuda) {
+            avail -= bo;
+        }
+        gpu_cap[m] = std::max<int64_t>(0, avail / b_gpu);
     }
 
-    auto count_cycles = [&](const uint32_t * w) {
+    struct score { double e2e, ttft, tpot; };
+    // score the windows w; the GPU layers g are filled to capacity unless keep_g (Halda's own choice)
+    auto evaluate = [&](const std::vector<uint32_t> & w, std::vector<uint32_t> & g, bool keep_g) {
         uint32_t W = 0, n_dev = 0;
         for (uint32_t m = 0; m < n_world; ++m) {
             W += w[m];
             n_dev += w[m] > 0;
         }
-        return std::make_pair(W > 0 && n_layer % W == 0 ? n_layer / W : 1, n_dev);
+        const uint32_t k = n_layer / W;
+        for (uint32_t m = 0; m < n_world && !keep_g; ++m) {
+            g[m] = (uint32_t)std::min<int64_t>(w[m], gpu_cap[m] / k);
+        }
+        score s;
+        s.ttft = predict_prefill_ms(n_world, dev_info_set.data(), w.data(), g.data(), model, cparams, n_prompt, n_cached, first,
+                                    hop_lat_ms.data(), hop_bw.data(), nullptr);
+        s.tpot = predict_prefill_ms(n_world, dev_info_set.data(), w.data(), g.data(), model, cparams, n_kv + 1, n_kv, false,
+                                    hop_lat_ms.data(), hop_bw.data(), nullptr)
+               + (n_dev > 1 ? (double)k * n_dev * cycle_cost_ms : 0.0);
+        s.e2e = s.ttft + n_gen * s.tpot;
+        return s;
     };
-    auto e2e = [&](const uint32_t * w, const uint32_t * g, float tpot, float * ttft, float * tpot_net) {
-        const auto kd = count_cycles(w); // (k, number of devices with layers)
-        *tpot_net = tpot + (kd.second > 1 ? kd.first * (lap_ms + kd.second * cycle_cost_ms) : 0.0);
-        *ttft     = predict_prefill_ms(n_world, dev_info_set.data(), w, g, model, cparams, n_prompt, n_cached, first,
-                                       hop_lat_ms.data(), hop_bw.data(), nullptr);
-        return *ttft + n_gen * *tpot_net;
-    };
+
+    LOG_INF("\nEnd-to-end search: n_prompt = %d, n_cached = %d, first = %d, n_gen = %d, decode KV = %d, cycle cost = %.2f ms per device switch\n",
+            n_prompt, n_cached, first, n_gen, n_kv, cycle_cost_ms);
+    LOG_INF("  GPU capacity in layers: %s\n", vec_to_str(gpu_cap).c_str());
 
     std::vector<uint32_t> best_w(n_layer_window, n_layer_window + n_world), best_g(n_gpu_layers, n_gpu_layers + n_world);
-    float best_tpot = *tpot_ms, ttft, tpot_net;
-    double best = e2e(best_w.data(), best_g.data(), best_tpot, &ttft, &tpot_net);
-    const uint32_t halda_k = count_cycles(best_w.data()).first;
-    LOG_INF("\nEnd-to-end selection: n_prompt = %d, n_cached = %d, first = %d, n_gen = %d, network lap = %.2f ms, cycle cost = %.2f ms per device switch\n",
-            n_prompt, n_cached, first, n_gen, lap_ms, cycle_cost_ms);
-    LOG_INF("  Halda (TPOT only): k = %2u, TPOT = %.1f (+net %.1f) ms, TTFT = %.1f ms, end-to-end = %.1f ms\n",
-            halda_k, best_tpot, tpot_net, ttft, best);
+    score best = evaluate(best_w, best_g, true);
+    LOG_INF("  Halda (TPOT only): k = %2u, windows %s, GPU layers %s | TTFT %.1f ms, TPOT %.1f ms, end-to-end %.1f ms\n",
+            n_layer / std::accumulate(best_w.begin(), best_w.end(), 0u), vec_to_str(best_w).c_str(), vec_to_str(best_g).c_str(),
+            best.ttft, best.tpot, best.e2e);
+    const std::vector<uint32_t> halda_w = best_w;
 
+    // the cycle counts to try: the one -k forces, else every divisor of n_layer that leaves windows of 2+ layers
+    std::vector<uint32_t> ks;
     for (uint32_t k = 1; k <= n_layer / 2; ++k) {
-        if (n_layer % k != 0 || k == halda_k) {
-            continue;
-        }
-        llama_context_params cparams_k = cparams;
-        cparams_k.n_cycles = k;
-        std::vector<uint32_t> w(n_world, 0), g(n_world, 0);
-        float tpot = -1.0f;
-        if (!assign_layers_and_select_devices(n_world, dev_info_set, w.data(), g.data(), model, cparams_k, n_prompt, &tpot) || tpot < 0.0f) {
-            LOG_INF("  k = %2u: infeasible\n", k);
-            continue;
-        }
-        const double t = e2e(w.data(), g.data(), tpot, &ttft, &tpot_net);
-        LOG_INF("  k = %2u: TPOT = %.1f (+net %.1f) ms, TTFT = %.1f ms, end-to-end = %.1f ms, windows %s\n",
-                count_cycles(w.data()).first, tpot, tpot_net, ttft, t, vec_to_str(w).c_str());
-        if (t < best) {
-            best = t;
-            best_w = w;
-            best_g = g;
-            best_tpot = tpot;
+        if (n_layer % k == 0 && (cparams.n_cycles == 0 || k == cparams.n_cycles)) {
+            ks.push_back(k);
         }
     }
 
-    LOG_INF("  chosen: k = %u, windows %s, GPU layers %s, end-to-end = %.1f ms\n\n",
-            count_cycles(best_w.data()).first, vec_to_str(best_w).c_str(), vec_to_str(best_g).c_str(), best);
+    // number of ways to split W layers over the devices, rank 0 taking at least one: C(W - 1 + n_world - 1, n_world - 1)
+    auto n_compositions = [&](uint32_t W) {
+        double c = 1.0;
+        for (uint32_t i = 1; i < n_world; ++i) {
+            c = c * (W - 1 + i) / i;
+        }
+        return c;
+    };
+    double total = 0.0;
+    for (uint32_t k : ks) {
+        total += n_compositions(n_layer / k);
+    }
+    const bool exhaustive = total <= 200000.0;
+    LOG_INF("  searching %s over %.0f window splits\n", exhaustive ? "exhaustively" : "locally", total);
+
+    uint64_t n_eval = 0;
+    std::vector<uint32_t> w(n_world, 0), g(n_world, 0);
+    for (uint32_t k : ks) {
+        const uint32_t W = n_layer / k;
+        std::vector<uint32_t> kbest_w, kbest_g;
+        score kbest = {1e30, 0, 0};
+        auto consider = [&]() {
+            ++n_eval;
+            const score s = evaluate(w, g, false);
+            if (s.e2e < kbest.e2e) {
+                kbest = s;
+                kbest_w = w;
+                kbest_g = g;
+            }
+        };
+
+        if (exhaustive) {
+            // every composition of W with w[0] >= 1, devices 1.. taking the rest in turn
+            std::function<void(uint32_t, uint32_t)> split = [&](uint32_t m, uint32_t left) {
+                if (m == n_world - 1) {
+                    w[m] = left;
+                    if (w[0] >= 1) {
+                        consider();
+                    }
+                    return;
+                }
+                for (uint32_t x = 0; x <= left; ++x) {
+                    w[m] = x;
+                    split(m + 1, left - x);
+                }
+            };
+            split(0, W);
+        } else {
+            // start from Halda's windows scaled to this k, then move single layers while it helps
+            uint32_t assigned = 0;
+            const uint32_t halda_W = std::accumulate(halda_w.begin(), halda_w.end(), 0u);
+            for (uint32_t m = 0; m < n_world; ++m) {
+                w[m] = (uint32_t)((uint64_t)halda_w[m] * W / halda_W);
+                assigned += w[m];
+            }
+            w[0] += W - assigned;
+            if (w[0] == 0) {
+                w[0] = 1;
+                for (uint32_t m = 1; m < n_world; ++m) {
+                    if (w[m] > 0) { --w[m]; break; }
+                }
+            }
+            consider();
+            for (bool improved = true; improved; ) {
+                improved = false;
+                for (uint32_t from = 0; from < n_world; ++from) {
+                    for (uint32_t to = 0; to < n_world; ++to) {
+                        if (from == to || w[from] == 0 || (from == 0 && w[0] == 1)) {
+                            continue;
+                        }
+                        const double before = kbest.e2e;
+                        --w[from]; ++w[to];
+                        consider();
+                        if (kbest.e2e < before) {
+                            improved = true;
+                        } else {
+                            ++w[from]; --w[to];
+                        }
+                    }
+                }
+                w = kbest_w;
+            }
+        }
+
+        if (kbest_w.empty()) {
+            continue;
+        }
+        LOG_INF("  k = %2u: windows %s, GPU layers %s | TTFT %.1f ms, TPOT %.1f ms, end-to-end %.1f ms\n",
+                k, vec_to_str(kbest_w).c_str(), vec_to_str(kbest_g).c_str(), kbest.ttft, kbest.tpot, kbest.e2e);
+        if (kbest.e2e < best.e2e) {
+            best = kbest;
+            best_w = kbest_w;
+            best_g = kbest_g;
+        }
+    }
+
+    LOG_INF("  chosen (%llu candidates scored): k = %u, windows %s, GPU layers %s | TTFT %.1f ms, TPOT %.1f ms, end-to-end %.1f ms\n\n",
+            (unsigned long long)n_eval, n_layer / std::accumulate(best_w.begin(), best_w.end(), 0u),
+            vec_to_str(best_w).c_str(), vec_to_str(best_g).c_str(), best.ttft, best.tpot, best.e2e);
     std::copy(best_w.begin(), best_w.end(), n_layer_window);
     std::copy(best_g.begin(), best_g.end(), n_gpu_layers);
-    *tpot_ms = best_tpot;
 }
 
 //
@@ -2283,10 +2390,10 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
                 const int  n_cached = (int)(params.expected_cache_hit * n_prompt);
                 const bool first    = n_prompt_given > 0 && !params.warmup;
 
-                if (params.halda_e2e && n_prompt > 0 && cparams.n_cycles == 0) { // -k fixes the cycles
-                    select_cycles_end_to_end(n_world, dev_info_set, n_layer_window, n_gpu_layers, &tpot_ms, model, cparams,
-                                             n_prompt, n_cached, first, params.n_predict > 0 ? params.n_predict : 256,
-                                             params.cycle_cost_ms, hop_lat_ms, hop_bw);
+                if (params.halda_e2e && n_prompt > 0) { // with -k, only the windows and GPU layers are searched
+                    search_assignment_end_to_end(n_world, dev_info_set, n_layer_window, n_gpu_layers, model, cparams,
+                                                 n_prompt, n_cached, first, params.n_predict > 0 ? params.n_predict : 256,
+                                                 params.cycle_cost_ms, hop_lat_ms, hop_bw);
                 }
 
                 if (n_prompt > 0) {
